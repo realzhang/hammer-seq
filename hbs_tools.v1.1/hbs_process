@@ -1,0 +1,559 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+use FindBin qw($Bin);
+use Getopt::Long;
+
+## This program is Copyright (C) 2015-2016, Ming-an Sun (mingansun@gmail.com)
+
+## This program is free software: you can redistribute it and/or modify
+## it under the terms of the GNU General Public License as published by
+## the Free Software Foundation, either version 3 of the License, or
+## (at your option) any later version.
+
+## This program is distributed in the hope that it will be useful,
+## but WITHOUT ANY WARRANTY; without even the implied warranty of
+## MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+## GNU General Public License for more details.
+
+## You should have received a copy of the GNU General Public License
+## along with this program. If not, see <http://www.gnu.org/licenses/>.
+
+my ($phred33, $phred64, $length_thres, $help);
+
+my $command_line = GetOptions(
+    'help'          => \$help,
+    'phred33-quals'  => \$phred33,
+    'phred64-quals'  => \$phred64,
+    'length:i'      => \$length_thres,
+    'help'          => \$help
+);
+
+if(@ARGV!=4 || $help){
+    print << 'USAGE';
+    
+  This script is used for the pre-processing of hairpin-BS-Seq data. It takes
+  paired-end hairpin-BS-Seq data (fastQ format) as input. It can: 
+  1) trim bad quality bases; 2) trim hairpin adaptor; 3) trim sequencing adaptor; 
+  4) discard short reads after trimming.
+
+  It invokes cross_match to check the occurrence of hairpin and sequencing adaptors.
+  Make sure cross_match is in the same folder of this script and is executable. If 
+  not, cross_match can be downloaded from http://www.phrap.org/phredphrapconsed.html.
+
+  USAGE:
+
+  hbs_process [options] <read file 1> <read file 2> <sequencing adaptor file> <hairpin adaptor file>
+
+  INPUT FILES:
+    
+  <read file 1>              FastQ file for read 1
+
+  <read file 2>              FastQ file for read 2
+
+  <sequencing adaptor file>  FastA file for sequencing adaptor. If not sure, you can use the last 24 bp
+                             of Illumina adaptor "ATCTCGTATGCCGTCTTCTGCTTG" to make a fasta file.
+  
+  <hairpin adaptor file>     FastA file for hairpin sequence. The script will automatically make the C>T 
+							 and G>A converted hairpins for read1 and read2, respectively.
+  
+  OPTIONS:
+  
+  --phred33-quals       FASTQ qualities are ASCII chars equal to the Phred quality plus 33. Default: on.
+
+  --phred64-quals       FASTQ qualities are ASCII chars equal to the Phred quality plus 64. Default: off.
+
+  --length              Length cut-off, default = 10. Read pairs with any read shorter than the threshold 
+                        will be discarded. 
+
+  --help                Show help information
+
+
+  EXAMPLE:
+
+  hbs_process --phred33-quals --length 10 read1.fq read2.fq adaptor.fa hairpin.fa
+
+  This script is last modified on Nov 22, 2015.
+
+USAGE
+
+exit(-1);
+}
+
+my ($fqfile1, $fqfile2, $adfile, $hpfile) = @ARGV;
+
+my $offset;
+if($phred33 && $phred64){
+    warn "Only one of phred33-qual or phred64-qual could be selected.\n";
+    exit(-1);
+}elsif(defined $phred64){
+    $offset = 64;
+}else{
+    $offset = 33;
+}
+
+$length_thres ||= 10;
+
+## to make sure all required scripts and executes are in the same folder of the main script
+my $cross_match;
+if(-e "$Bin/cross_match"){
+    $cross_match = "$Bin/cross_match";
+}
+else{
+    die "Cannot find $Bin/cross_match, please make sure to put it in the same folder of hbs_process\n";
+}
+
+## parameters    
+warn "Step 1: trim bad quality bases from tail\n\n";
+my ($original_read_num, $trimmed_read_num) = &trim_base($fqfile1, $fqfile2, 2, $length_thres);
+warn "Total number of read pairs: $original_read_num\n";
+warn "Read pairs after trimming bad quality bases: $trimmed_read_num\n\n\n";
+
+&make_converted_hp_file($hpfile);
+warn "Step 2: trim hairpin and sequencing adaptors\n\n";
+warn "Trimming $fqfile1 ...\n";
+&filt_adaptors("$fqfile1\.trim", $adfile, "$hpfile\.C2T");
+warn "Trimming $fqfile2 ...\n\n\n";
+&filt_adaptors("$fqfile2\.trim", $adfile, "$hpfile\.G2A");
+
+warn "Step 3: discard read pairs shorter than $length_thres bp\n";
+my $good_read_num = &filt_length_of_fq_pair("$fqfile1\.trim.adFilt.hpFilt", "$fqfile2\.trim.adFilt.hpFilt", $length_thres, "$fqfile1\.processed", "$fqfile2\.processed");
+warn "Number of read pairs after processing: $good_read_num\n\n\n";
+
+warn "Clean temporary files \n";
+&clean_temp_files($fqfile1);
+&clean_temp_files($fqfile2);
+unlink("$hpfile.C2T");
+unlink("$hpfile.G2A");
+
+warn "\nThe processing steps are finished.\n\n";
+
+############################################################################################
+################################### subroutines ############################################
+############################################################################################
+## clean temp file based on suffix
+sub clean_temp_files{
+    my $file = shift;
+    unlink("$file.trim");
+    unlink("$file.trim.adFilt");
+    unlink("$file.trim.adFilt.hpFilt");
+    unlink("$file.trim.fa");
+    unlink("$file.trim.fa.adMask");
+    unlink("$file.trim.fa.screen");
+    unlink("$file.trim.fa.cm.tmp");
+    unlink("$file.trim.fa.cm.tmp.log");
+    unlink("$file.trim.fa.cm.tmp.screen");
+    unlink("$file.trim.fa.adFilt");
+    unlink("$file.trim.fa.adFilt.cm.tmp");
+    unlink("$file.trim.fa.adFilt.cm.tmp.log");
+    unlink("$file.trim.fa.adFilt.cm.tmp.screen");
+    unlink("$file.trim.fa.adFilt.hpMask");
+    unlink("$file.trim.fa.adFilt.screen");
+    unlink("$file.trim.fa.adFilt.hpFilt");
+}
+
+## trim fastq files
+sub trim_base{
+    my ($fqfile1, $fqfile2, $qual_thres, $length_thres) = @_;
+    
+    my $original_read_num = 0;
+    my $trimed_read_num   = 0;
+    open(TRIM1, ">$fqfile1\.trim")||die"Cannot open $fqfile1\.trim\n";
+    open(TRIM2, ">$fqfile2\.trim")||die"Cannot open $fqfile2\.trim\n";
+    if($fqfile1 =~ /\.gz/){
+        open(FQ1, "zcat $fqfile1 |")||die"Cannot open the pipe to $fqfile1\n";
+    }
+    else{
+        open(FQ1, $fqfile1)||die"Cannot open $fqfile1\n";
+    }
+    if($fqfile2 =~ /\.gz/){
+        open(FQ2, "zcat $fqfile2 |")||die"Cannot open the pipe to $fqfile2\n";
+    }
+    else{
+        open(FQ2, $fqfile2)||die"Cannot open $fqfile2\n";
+    }
+    while(my $name1 = <FQ1>){
+        my $name2 = <FQ2>;
+        chomp $name1;
+        chomp $name2;
+        if($name1 =~ /^\@/ && $name1 =~ /^\@/){
+            $original_read_num++;
+            $name1 =~ s/\s+.*$//;
+            $name2 =~ s/\s+.*$//;
+            my $seq1 = <FQ1>; chomp $seq1;
+            <FQ1>;
+            my $qual1 = <FQ1>; chomp $qual1;
+            my $seq2 = <FQ2>;  chomp $seq2;
+            <FQ2>;
+            my $qual2 = <FQ2>; chomp $qual2;
+            
+            my @seq_arr1   = split(//, $seq1);
+            my @qual_arr1  = split(//, $qual1);
+            my @seq_arr2   = split(//, $seq2);
+            my @qual_arr2  = split(//, $qual2);
+            my $seq1_trim  = ""; my $qual1_trim = "";
+            my $seq2_trim  = ""; my $qual2_trim = "";
+            # remove heading Ns
+            while(@seq_arr1 > 0 && ($seq_arr1[0] eq "N" || ord($qual_arr1[0])-$offset <= $qual_thres)){
+                shift @seq_arr1; 
+                shift @qual_arr1;
+            }
+            while(@seq_arr2 > 0 && ($seq_arr2[0] eq "N" || ord($qual_arr2[0])-$offset <= $qual_thres)){
+                shift @seq_arr2;
+                shift @qual_arr2;
+            }
+            # trim before bad residues
+            for(my $i=0; $i<@qual_arr1; $i++){
+                my $qual = ord($qual_arr1[$i]) - $offset;
+                if($seq_arr1[$i] ne "N" && $qual > $qual_thres){
+                    $seq1_trim  .= $seq_arr1[$i];
+                    $qual1_trim .= $qual_arr1[$i];
+                }else{
+                    last;
+                }
+            }
+            for(my $i=0; $i<@qual_arr2; $i++){
+                my $qual = ord($qual_arr2[$i]) - $offset;
+                if($seq_arr2[$i] ne "N" && $qual > $qual_thres){
+                    $seq2_trim  .= $seq_arr2[$i];
+                    $qual2_trim .= $qual_arr2[$i];
+                }else{
+                    last;
+                }
+            }
+            
+            if(length($seq1_trim)>=$length_thres && length($seq2_trim)>=$length_thres){
+                print TRIM1 "$name1\n$seq1_trim\n+\n$qual1_trim\n";
+                print TRIM2 "$name2\n$seq2_trim\n+\n$qual2_trim\n";
+                $trimed_read_num++;
+            }
+        }
+        else{
+            warn "The lines doesn't appear as name lines: $name1\t$name2\n";
+        }
+    }
+    close FQ1;
+    close FQ2;
+    close TRIM1;
+    close TRIM2;
+    
+    return($original_read_num, $trimed_read_num);
+}
+
+sub make_converted_hp_file{
+    my $hpfile = shift;
+    open(HP, $hpfile)||die"Cannot open $hpfile\n";
+    open(HPC2T, ">$hpfile\.C2T")||die"Cannot open $hpfile\.C2T\n";
+    open(HPG2A, ">$hpfile\.G2A")||die"Cannot open $hpfile\.G2A\n";
+    while(<HP>){
+        if(/^>/){
+            print HPC2T $_;
+            print HPG2A $_;
+        }
+        else{
+            chomp $_;
+            my $c2t = uc($_);
+            my $g2a = uc($_);
+            $c2t =~ tr/C/T/;
+            $g2a = reverse($c2t);
+            $g2a =~ tr/ATGC/TACG/;
+            ## C>T converted
+            print HPC2T "$c2t\n";
+            ## reverse complement to C>T converted hairpin
+            print HPG2A "$g2a\n";
+        }
+    }
+    close HP;
+    close HPC2T;
+    close HPG2A;
+}
+
+sub filt_adaptors{
+    my ($fq_file, $adaptor_file, $hairpin_file) = @_;
+    &fq2fa($fq_file, "$fq_file\.fa");
+    &filt_adaptor("$fq_file\.fa", $adaptor_file);
+    &filt_masked_fq("$fq_file\.fa.adMask", $fq_file, "h", "$fq_file\.adFilt");
+    &filt_hairpin("$fq_file\.fa.adFilt", $hairpin_file);
+    &filt_masked_fq("$fq_file\.fa.adFilt.hpMask", "$fq_file\.adFilt", "t", "$fq_file\.adFilt.hpFilt");
+}
+
+# convert fastQ to fastA format
+sub fq2fa{
+    my $fq_file = shift;
+    my $fa_file = shift;
+    open(FQ, $fq_file)||die"Cannot open $fq_file\n";
+    open(FA, ">$fa_file")||die"Cannot open $fa_file\n";
+    while(my $ln1 = <FQ>){
+        my $ln2 = <FQ>;
+        <FQ>; <FQ>;
+        if($ln1 =~ /^\@/){
+            $ln1 =~ s/^\@/\>/;
+            print FA $ln1 . $ln2;
+        }
+        else{
+            warn "FastQ format error: $ln1\n";
+        }
+    }
+    close FQ;
+    close FA;
+}
+
+sub do_cross_match{
+	my ($faFile, $adaptorFile, $screenFile, $tmpFile, $num) = @_;
+	my @tmp = ();
+	`rm $screenFile` if -e $screenFile;
+	open(FA, $faFile)||die"Cannot open $faFile\n";
+	$/ = ">";
+	while(<FA>){
+		s/>//;
+		next unless /\S/;
+		push(@tmp, $_);
+		if(@tmp==$num){
+			open(TMP,">$tmpFile")||die"Cannot open $tmpFile\n";
+			foreach (@tmp){
+				print TMP ">$_\n";
+			}
+			close TMP;
+			@tmp = ();
+			`$cross_match $tmpFile $adaptorFile -minmatch 8 -minscore 12 -screen >/dev/null 2>/dev/null`;
+			&append_file("$tmpFile\.screen", $screenFile);
+			
+		}
+	}
+	$/ = "\n";
+	close FA;
+	if(@tmp){
+		open(TMP,">$tmpFile")||die"Cannot open $tmpFile\n";
+		foreach (@tmp){
+			print TMP ">$_\n";
+		}
+		close TMP;
+		`$cross_match $tmpFile $adaptorFile -minmatch 8 -minscore 12 -screen >/dev/null 2>/dev/null`;
+		&append_file("$tmpFile\.screen", $screenFile);
+	}
+}
+
+sub filt_adaptor{
+
+    my ($faFile, $adaptorFile) = @_;
+
+    # get adaptor seq
+    open(H, $adaptorFile)||die"Cannot open $adaptorFile\n";
+    <H>; 
+    my $adaptor = <H>;
+    $adaptor =~ s/\W//g;
+    $adaptor = uc $adaptor;
+    close H;
+
+    # Step 1. cross_match to mask remained adaptor sequences of long length
+    &do_cross_match($faFile, $adaptorFile, "$faFile\.screen", "$faFile\.cm.tmp", 10000);
+
+    # Step 2. remove short adaptor fragments from the end of reads
+    my @adaptors;
+    while(length($adaptor)>=1){ # remove even if only 1 base is matched
+	    push(@adaptors, $adaptor);
+	    $adaptor =~ s/^\w//;
+    }
+
+    open(IN, "$faFile.screen")||die"Cannot open $faFile.screen\n";
+    open(MASK, ">$faFile.adMask")||die"Cannot open $faFile.adMask\n";	# masked as X
+    open(FILT, ">$faFile.adFilt")||die"Cannot open $faFile.adFilt\n";	# X and following base are removed
+    $/ = ">";
+    while(<IN>){
+	    s/>//;
+	    if(/^(\S+)[^\n]*\n(.*)$/s){
+		    my ($name, $seq) = ($1, $2);
+		    $seq =~ s/\W//g;
+		    my $matchNum = 0;
+		    my $newSeq = '';
+		    foreach my $x (@adaptors){
+			    if($seq =~ /^$x/){
+				    $matchNum = length($x);
+				    $newSeq = "X" x $matchNum . substr($seq, $matchNum, length($seq)-$matchNum);
+				    last;
+			    }
+		    }
+		    if($matchNum == 0){
+			    $newSeq = $seq;
+		    }
+		    print MASK ">$name\n$newSeq\n";
+		    $newSeq =~ s/^.*X//;
+		    print FILT ">$name\n$newSeq\n";
+	    }
+    }
+    $/ = "\n";
+    close IN;
+    close MASK;
+    close FILT;
+
+}
+
+sub filt_hairpin{
+    my ($faFile, $hairpinFile) = @_;
+
+    # get hairpin seq
+    my @hpSeq;
+    open(H, $hairpinFile)||die"Cannot open $hairpinFile\n";
+    $/ = ">";
+    while(<H>){
+		    s/>//;
+		    if(/^\S+[^\n]*\n(.*)$/s){
+				    my $seq = $1;
+				    $seq =~ s/\W//g;
+				    $seq = uc $seq;
+				    push(@hpSeq, $seq);
+		    }
+    }
+    $/ = "\n";
+    close H;
+
+    # Step 1. cross_match to mask remained hairpin sequences of long length
+    &do_cross_match($faFile, $hairpinFile, "$faFile\.screen", "$faFile\.cm.tmp", 10000);
+
+    # Step 2. remove short hairpin fragments from the end of reads
+    my (@hairpins, %hairpins);
+    my $hairpin = $hpSeq[0];
+    while(length($hairpin)>=1){ # remove even if only 1 aa is matched
+	    push(@hairpins, $hairpin) unless defined $hairpins{$hairpin};
+	    $hairpins{$hairpin} = '';
+	    chop $hairpin;
+    }
+
+    open(IN, "$faFile.screen")||die"Cannot open $faFile.screen\n";
+    open(MASK, ">$faFile.hpMask")||die"Cannot open $faFile.hpMask\n";	# masked as X
+    open(FILT, ">$faFile.hpFilt")||die"Cannot open $faFile.hpFilt\n";	# X and following aa are removed
+    $/ = ">";
+    while(<IN>){
+	    s/>//;
+	    if(/^(\S+)[^\n]*\n(.*)$/s){
+		    my ($name, $seq) = ($1, $2);
+		    $seq =~ s/\W//g;
+		    my $matchNum = 0;
+		    my $newSeq = '';
+		    foreach my $x (@hairpins){
+			    if($seq =~ /$x$/){
+				    $matchNum = length($x);
+                    $newSeq = $seq;
+					my $xs = 'X' x $matchNum;
+                    $newSeq =~ s/\w{$matchNum}$/$xs/; # check from tail
+                    last;
+			    }
+		    }
+		    if($matchNum == 0){
+			    $newSeq = $seq;
+		    }
+		    print MASK ">$name\n$newSeq\n";
+		    $newSeq =~ s/X.*$//;
+		    print FILT ">$name\n$newSeq\n";
+	    }
+    }
+    $/ = "\n";
+    close IN;
+    close MASK;
+    close FILT;
+
+}
+
+sub filt_masked_fq{
+    my ($masked_fa_file, $fq_file, $direction, $out_file) = @_;
+
+    open(FA, $masked_fa_file)||die"Cannot open $masked_fa_file\n";
+    open(FQ, $fq_file)||die"Cannot open $fq_file\n";
+    open(OUT, ">$out_file")||die"Cannot write to $out_file\n";
+    $/ = ">";
+    while(<FA>){
+		    s/>//;
+		    if(/^(\S+)[^\n]*\n(.*)$/s){
+				    my ($fa_name, $fa_seq) = ($1, $2);
+				    $fa_seq =~ s/\W//g;
+				    $/ = "\n";
+				    my $fq_name = <FQ>; $fq_name =~ s/^\@//; $fq_name =~ s/\s+.*$//;
+				    print STDERR "Name error: $fa_name != $fq_name\n" unless $fa_name eq $fq_name;
+				    my $fq_seq  = <FQ>; $fq_seq  =~ s/\W//g;
+				    <FQ>;
+				    my $fq_qual = <FQ>; $fq_qual =~ s/\s//g;
+				    my $fa_seq_len = length($fa_seq);
+				    my $fq_seq_len = length($fq_seq);
+				    unless($fa_seq_len == $fq_seq_len){
+						    print STDERR "Length error: $fa_name ($fa_seq_len), $fq_name ($fq_seq_len)\n";
+				    }
+				    if($direction eq "h"){
+						    if($fa_seq =~ /^(.*X)/){
+								    my $mask_len = length($1);
+								    $fq_seq =~ s/^\S{$mask_len}//;
+								    $fq_qual =~ s/^\S{$mask_len}//;
+						    }
+				    }elsif($direction eq "t"){
+						    if($fa_seq =~ /(X.*)$/){
+								    my $mask_len = length($1);
+								    $fq_seq =~ s/\S{$mask_len}$//;
+								    $fq_qual =~ s/\S{$mask_len}$//;
+						    }
+				    }elsif($direction eq "m"){
+                        my $start = 0;
+                        my $len = 0;
+                        while($fa_seq =~ /([^X]+)/g){
+                            my $frag = $1;
+                            my $this_len = length($1);
+                            if($this_len>$len){
+                                $len = $this_len;
+                                $start = length($`);
+                            }
+                        }
+                        $fq_seq = substr($fq_seq, $start, $len);
+                        $fq_qual = substr($fq_qual, $start, $len);
+
+                    }else{
+						    ;
+				    }
+				    print OUT "\@$fq_name\n$fq_seq\n+\n$fq_qual\n";
+				    $/ = ">";
+		    }
+    }
+    $/ = "\n";
+    close FA;
+    close FQ;
+    close OUT;
+}
+
+sub filt_length_of_fq_pair{
+    my ($fq_file1, $fq_file2, $length_thres, $outfile1, $outfile2) = @_;
+
+    open(FQ1, $fq_file1)||die"Cannot open $fq_file1\n";
+    open(FQ2, $fq_file2)||die"Cannot open $fq_file2\n";
+    open(FILT1, ">$outfile1")||die"Cannot open $outfile1\n";
+    open(FILT2, ">$outfile2")||die"Cannot open $outfile2\n";
+
+    my $count_all  = 0;
+    my $count_good = 0;
+
+    while(my $a1 = <FQ1>){
+		    $count_all++;
+		    my $a2 = <FQ1>; my $a3 = <FQ1>; my $a4 = <FQ1>;
+		    my $b1 = <FQ2>; my $b2 = <FQ2>; my $b3 = <FQ2>; my $b4 = <FQ2>;
+		    if(length($a2)>$length_thres && length($b2)>$length_thres){
+				    $count_good++;
+				    print FILT1 "$a1$a2$a3$a4";
+				    print FILT2 "$b1$b2$b3$b4";
+		    }
+    }
+    close FQ1;
+    close FQ2;
+    close FILT1;
+    close FILT2;
+
+    my $ratio_good = sprintf("%.2f", $count_all>0 ? $count_good/$count_all*100 : 0);
+    return($count_good);
+}
+
+sub append_file{
+    my ($tmp_file, $result_file) = @_;
+    open(TMP, $tmp_file)||die"Cannot open $tmp_file\n";
+    open(RESULT, ">>$result_file")||die"Cannot open $result_file\n";
+    while(my $ln = <TMP>){
+        print RESULT $ln;
+    }
+    close TMP;
+    close RESULT;
+}
+

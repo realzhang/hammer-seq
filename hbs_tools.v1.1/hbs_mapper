@@ -1,0 +1,2257 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+use Getopt::Long;
+use FindBin qw($Bin);
+use Cwd;
+
+## This program is Copyright (C) 2015-16, Ming-an Sun (mingansun@gmail.com)
+
+## This program is free software: you can redistribute it and/or modify
+## it under the terms of the GNU General Public License as published by
+## the Free Software Foundation, either version 3 of the License, or
+## (at your option) any later version.
+
+## This program is distributed in the hope that it will be useful,
+## but WITHOUT ANY WARRANTY; without even the implied warranty of
+## MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+## GNU General Public License for more details.
+
+## You should have received a copy of the GNU General Public License
+## along with this program. If not, see <http://www.gnu.org/licenses/>.
+
+
+##############################################################################
+# get parameters from command line
+
+my $version = "1.1";
+
+
+my ($read_file1,$read_file2,$bowtie_index,$path_to_bowtie,$bowtie2,$keep_temp,$identity_thres,$sequence_format,$bowtie_options,
+$phred64,$solexa,$work_dir,$output_dir, $sam_no_hd) = &parse_arguments();
+
+#warn "\n" . '=' x 80 . "\n" . `date` . "\n";
+
+# to store countings for mapping and methylation calling
+my %counting; 
+&initial_counting(); # initial all countings as 0
+
+#######################################################################################################
+# STEP1: align read pairs to recover original sequence
+#
+# below is an example showing how to recover the original reads
+# 
+# first align read1 and read2
+# ACTCGTAGTAGTAACGTAAAGATAAACAGTATTATTTGGAATTAAGTTATGGTCGAAAGTTATTAAAAATAAAAATAAATAAATAAATAAATAAAT   read1 (C>T converted)
+# --TCGCAACAACAACGCAAAAACAAACAACATCACCTAAAACCAAACCATAACCGAAAACTATCAAAAACAAAAACAAACAAACAAACAAACAAA-   read2 (G>A converted)
+# 
+# then remove overhangs
+#   TCGTAGTAGTAACGTAAAGATAAACAGTATTATTTGGAATTAAGTTATGGTCGAAAGTTATTAAAAATAAAAATAAATAAATAAATAAATAAA    read1 (C>T converted)
+#   TCGCAACAACAACGCAAAAACAAACAACATCACCTAAAACCAAACCATAACCGAAAACTATCAAAAACAAAAACAAACAAACAAACAAACAAA    read2 (G>A converted)
+#
+# the original sequence can be recovered as below, since read1 is C>T converted, while read2 is G>A converted
+#   TCGCAGCAGCAACGCAAAGACAAACAGCATCACCTGGAACCAAGCCATGGCCGAAAGCTATCAAAAACAAAAACAAACAAACAAACAAACAAA   original
+warn "\n\n" . '=' x 80 . "\n" . `date` . "\n";
+sleep(1);
+warn "Align read pairs, and recover original sequences ...\n";
+warn "This may take long time, depending on the size of input file\n\n";
+my $align_file         = "$output_dir$read_file1\.aln"; # alignment result (overhangs removed)
+my $original_seq_file  = "$output_dir$read_file1\.ori"; # recovered original sequence of fastA format
+#if(! -e $original_seq_file){
+open(PARSEOUT, ">$align_file")         || die"Cannot write to $align_file\n";
+open(SEQOUT,   ">$original_seq_file")  || die"Cannot write to $original_seq_file\n";
+&parse_read_pair($read_file1, $read_file2, $identity_thres);
+close PARSEOUT;
+close SEQOUT;
+#}
+warn "Original sequences are recovered, and outputed to $original_seq_file\n";
+
+
+#######################################################################################################
+# STEP2: map original sequence to reference genome using bowtie
+# Unless traditional bisulfite sequencing data which need to be converted before mapping (such as the Stratagy used in Bismark)
+# the original sequence recovered from hairping bisulfite sequencing data can be mapped to reference genome using Bowtie directly
+warn "\n\n" . '=' x 80 . "\n" . `date` . "\n";
+sleep(1);
+
+my $bowtie_output_file = "$original_seq_file\.bowtie";
+
+if($bowtie2){
+    my $ref = '-x ' . $bowtie_index;
+    warn "Map recovered original sequence to reference genome using bowtie 2...\n\n";
+    warn "Bowtie parameters: $bowtie_options\n\n";
+    warn "Bowtie index: $bowtie_index\n\n";
+    warn "$path_to_bowtie -t $bowtie_options $ref -U $original_seq_file -S $bowtie_output_file\n";
+    system("$path_to_bowtie -t $bowtie_options $ref -U $original_seq_file -S $bowtie_output_file 2>$bowtie_output_file\.log");
+    warn "\nMapping finished, with basic statistic as below\n\n";
+    warn `cat $bowtie_output_file\.log`;
+}
+else{
+    warn "Map recovered original sequence to reference genome using bowtie 1 ...\n\n";
+    warn "Bowtie parameters: $bowtie_options\n\n";
+    warn "Bowtie index: $bowtie_index\n\n";
+    warn "$path_to_bowtie -t $bowtie_options $bowtie_index $original_seq_file >$bowtie_output_file\n";
+    system("$path_to_bowtie $bowtie_options $bowtie_index $original_seq_file >$bowtie_output_file 2>$bowtie_output_file\.log");
+    warn "\nMapping finished, with basic statistic as below\n\n";
+    warn `cat $bowtie_output_file\.log`;
+}
+
+#######################################################################################################
+# STEP3: generate a new SAM file with methylation patterns
+# by combining different types of data, methylation patterns will be inferred
+# raw reads + mapping result + reference => methylation calling
+warn "\n\n" . '=' x 80 . "\n" . `date` . "\n";
+sleep(1);
+warn "Parsing Bowtie output, and generate a new SAM file with methylation pattern ...\n";
+warn "This may take long time\n";
+
+my $samFile = "$output_dir$read_file1\.recovered.sam";
+open(SAMOUT, ">$samFile")||die"Cannot write to $samFile\n"; # SAM file
+
+my $sam_header = "\@HD\tVN:1.0\tSO:unsorted\n";
+
+my %chromosomes;
+# read chromosomes into hash table
+$sam_header .= &read_chromosomes($bowtie_index, \%chromosomes); # read fastA files in the same dir for bowtie indexed reference
+# compare reads with reference, and get methylation pattern
+$sam_header .= "\@PG\tID:HBS_mapper\tVN:$version\tCL:\"$0 " . join(" ", @ARGV) . "\"\n";
+
+
+warn "Outputing results to $samFile\n";
+print SAMOUT $sam_header unless $sam_no_hd==1;
+
+if ($bowtie2){
+    &perform_methylation_call2($bowtie_output_file, $align_file);
+}
+else{
+    &perform_methylation_call($bowtie_output_file, $align_file);
+}
+close SAMOUT;
+
+
+#######################################################################################################
+# STEP4: generate report file about mapping and methylation calling
+#        cleaning temporatory files
+warn "\n\n" . '=' x 80 . "\n" . `date` . "\n";
+sleep(1);
+warn "Output report to $samFile.report.txt\n";
+&make_report("$samFile.report.txt");
+
+# cleaning temp files
+
+
+unlink "$output_dir$read_file1\.ori.bowtie.log" or warn "Cannot remove $output_dir$read_file1\.ori.bowtie.log\n";
+unlink "$output_dir$read_file1\.pair" or warn "Cannot remove $output_dir$read_file1\.pair\n";
+unlink "$align_file\.tmp" or warn "Cannot remove $align_file\.tmp\n";
+
+if($keep_temp == 0){
+	warn "\nCleaning temporatory files\n\n";
+	if(unlink $align_file){
+		warn "$align_file is successfully deleted\n";
+	}else{
+		warn "Cannot remove $align_file\n";
+	}
+	if(unlink $original_seq_file){
+		warn "$original_seq_file is successfully deleted\n";
+	}else{
+		warn "Cannot remove $original_seq_file\n";
+	}
+	if(unlink $bowtie_output_file){
+		warn "$bowtie_output_file is successfully deleted\n";
+	}else{
+		warn "Cannot remove $bowtie_output_file\n";
+	}
+}
+else{
+	warn "\nTemporatory files including alignment from read1 and read2, recovered original sequence\nand original bowtie output are kept for further use. The user can delete it manually.\n";
+}
+
+warn "\nJob finished!\n";
+
+warn "\n" . '=' x 80 . "\n\n";
+
+
+######################################################################################################
+######################################### subroutines  ###############################################
+######################################################################################################
+
+
+## initial all countings as 0
+sub initial_counting{
+    $counting{total_recovered_sequence} = 0;
+    $counting{total_read_pair}          = 0;    
+    $counting{total_mappable_read}      = 0;    # all mappable reads
+    $counting{unique_mappable_read}     = 0;    # unique mappable reads
+    $counting{total_meCHH_count}        = 0;
+    $counting{total_meCHG_count}        = 0;
+    $counting{total_meCpG_count}        = 0;
+    $counting{total_unmethylated_CHH_count} = 0;
+    $counting{total_unmethylated_CHG_count} = 0;
+    $counting{total_unmethylated_CpG_count} = 0;
+}
+
+## get file format, FastA or FastQ
+sub get_sequence_format{
+    my $file = shift;
+    open(TMP, $file)||die"Cannot open $file\n";
+    my $head = <TMP>;
+    close TMP;
+    my $filetype;
+    if($head =~ /^>/){
+        $filetype = 'FASTA';
+    }
+    elsif($head =~ /^\@/){
+        $filetype = 'fastq';
+    }
+    else{
+        $filetype = 'NA';
+        warn "File format unrecognized: $file doesn't seem to be FastA or FastQ format!\n";
+        exit;
+    }
+    return $filetype;
+}
+
+
+## check if the file format (FastA or FastQ) is correct
+sub check_sequence_format{
+    my ($sequence_format, $file) = @_;
+    my $real_format = &get_sequence_format($file);
+    unless($sequence_format eq $real_format){
+        warn "Incorrect file format: $file seems to be of $real_format format\n";
+        exit;
+    }
+}
+
+## get name core for read pairs
+sub get_core_name{
+    my ($name1, $name2) = @_;
+    my @arr1 = split(//, $name1);
+    my @arr2 = split(//, $name2);
+    my $core = '';
+    while(@arr1 && @arr2){
+        my $x = shift @arr1;
+        my $y = shift @arr2;
+        if($x eq $y){
+            $core .= $x;
+        }
+        else{
+            last;
+        }
+    }
+    $core =~ s/\#$//;
+    return $core;
+}
+
+## parse read pairs
+sub parse_read_pair{
+    my ($file1, $file2, $identity_thres) = @_;
+    
+    my $con = 0;
+    
+    if($sequence_format eq 'FASTA'){ # fastA format
+        $/ = '>';
+        open(FA1, $file1) || die"Cannot open $file1\n";
+        open(FA2, $file2) || die"Cannot open $file2\n";
+        open(PAIR, ">$output_dir$file1\.pair") || die"Cannot open $output_dir$file1\.pair\n";
+        while(my $a = <FA1>){
+            my $b = <FA2>;
+            $a =~ s/>//;
+            $b =~ s/>//;
+            if($a =~ /^(\S+)[^\n]*\n(.*)$/s){
+                my ($name1, $seq1) = ($1, $2);
+                if($b =~ /^(\S+)[^\n]*\n(.*)$/s){
+                    #warn "$con read pairs processed\n" if ++$con%100000==0;
+                    my ($name2, $seq2) = ($1, $2);
+                    $seq1 =~ s/\W//;
+                    $seq1 = uc $seq1;
+                    $seq2 =~ s/\W//;
+                    $seq2 = uc $seq2;
+                    my $nameCore = &get_core_name($name1, $name2);
+                    print PAIR "$nameCore\t$seq1\t$seq2\n";
+                }
+            }
+        }
+        close FA1;
+        close FA2;
+        close PAIR;
+        $/ = "\n";
+        warn "$Bin/nw_align $output_dir$file1\.pair >$output_dir$file1\.aln.tmp\n\n";
+        system("$Bin/nw_align $output_dir$file1\.pair >$output_dir$file1\.aln.tmp");
+        warn "Alignment of read1 and read2 finished.\n\n";
+        
+        warn "Recovering original sequences for read pairs with identity >= $identity_thres\n\n";
+        open(ALN, "$output_dir$file1\.aln.tmp")||die"Cannot open $output_dir$file1\.aln.tmp\n";
+        while(<ALN>){
+            my ($nameCore, $aln1, $aln2) = split;
+            my $matchStr = &make_match_string($aln1, $aln2);
+            my ($originalRead, $aln1_trim, $aln2_trim, $identity, $mismatch) = &parse_alignment_fasta($aln1, $aln2, $matchStr);
+            my $trim_len = length($aln1_trim);
+            print PARSEOUT "$nameCore\t$originalRead\t$aln1_trim\t$aln2_trim\t$trim_len\t$mismatch\t$identity\n";
+            if($identity >= $identity_thres){
+                print SEQOUT   ">$nameCore\n$originalRead\n";
+                $counting{total_recovered_sequence}++;
+            }
+            $counting{total_read_pair}++;
+        }
+        close ALN;
+        warn "Recovered $counting{total_recovered_sequence} original sequences\n\n";
+    }
+    elsif($sequence_format eq 'FASTQ'){    # fastQ format
+        open(FQ1, $file1) || die"Cannot open $file1\n";
+        open(FQ2, $file2) || die"Cannot open $file2\n";
+        open(PAIR, ">$output_dir$file1\.pair") || die"Cannot open $output_dir$file1\.pair\n";
+        while(my $name1 = <FQ1>){
+            my $name2 = <FQ2>;
+            my $seq1  = <FQ1>;
+            my $seq2  = <FQ2>;
+            <FQ1>; # skip 3rd line in file2
+            <FQ2>; # skip 3rd line in file2
+            my $qual1 = <FQ1>;
+            my $qual2 = <FQ2>;
+            if($name1 =~ /^\@(\S+)/){
+                my $name1 = $1;
+                if($name2 =~ /^\@(\S+)/){
+                    warn "$con read pairs processed\n" if ++$con%100000==0;
+                    my $name2 = $1;
+                    $seq1 =~ s/\W//;
+                    $seq1 = uc $seq1;
+                    $seq2 =~ s/\W//;
+                    $seq2 = uc $seq2;
+                    my $nameCore = &get_core_name($name1, $name2);
+                    print PAIR "$nameCore\t$seq1\t$seq2\n";
+                }
+            }
+        }
+        close FQ1;
+        close FQ2;
+        close PAIR;
+        $/ = "\n";
+        warn "$Bin/nw_align $output_dir$file1\.pair >$output_dir$file1\.aln.tmp\n\n";
+        system("$Bin/nw_align $output_dir$file1\.pair >$output_dir$file1\.aln.tmp");
+        warn "Alignment of read1 and read2 finished.\n\n";
+        
+        warn "Recovering original sequences for read pairs with identity >= $identity_thres\n\n";
+        open(FQ1, $file1) || die"Cannot open $file1\n";
+        open(FQ2, $file2) || die"Cannot open $file2\n";
+        open(ALN, "$output_dir$file1\.aln.tmp")||die"Cannot open $output_dir$file1\.aln.tmp\n";
+        while(<ALN>){
+            my $name1 = <FQ1>;
+            my $name2 = <FQ2>;
+            my $seq1  = <FQ1>;
+            my $seq2  = <FQ2>;
+            <FQ1>; # skip 3rd line in file2
+            <FQ2>; # skip 3rd line in file2
+            my $qual1 = <FQ1>;
+            my $qual2 = <FQ2>;
+            
+            my ($nameCore, $aln1, $aln2) = split;
+            my $matchStr = &make_match_string($aln1, $aln2);
+            my ($original_seq, $aln1_trim, $aln2_trim, $combined_qual, $qual1_trim, $qual2_trim, $identity, $mismatch) = &parse_alignment_fastq($aln1, $aln2, $matchStr, $qual1, $qual2);
+            my $trim_len = length($aln1_trim);
+            print PARSEOUT "$nameCore\t$original_seq\t$aln1_trim\t$aln2_trim\t$trim_len\t$mismatch\t$identity\n";
+            if($identity >= $identity_thres){
+                print SEQOUT   "\@$nameCore\n$original_seq\n+\n$combined_qual\n" ;
+                $counting{total_recovered_sequence}++;
+            }
+            $counting{total_read_pair}++;
+        }
+        warn "Recovered $counting{total_recovered_sequence} original sequences\n\n";
+        close ALN;      
+        close FQ1;
+        close FQ2;
+
+    }else{
+        die "$sequence_format:\tFile format should be FastA or FastQ!\n";
+    }
+}
+
+
+## get match string from alignments
+# * match
+# + bisulfite conversion (T-C or G-A)
+# . mismatch
+# - gap
+sub make_match_string{
+    my ($aln1, $aln2) = @_;
+    my @arr1 = split(//, $aln1);
+    my @arr2 = split(//, $aln2);
+    my $match_str = '';
+    while(@arr1 && @arr2){
+        my $a = shift @arr1;
+        my $b = shift @arr2;
+        if($a eq $b){
+            $match_str .= "*";
+        }
+        elsif(($a eq "T" && $b eq "C") || ($a eq "G" && $b eq "A")){
+            $match_str .= "+";
+        }
+        elsif($a eq "-" || $b eq "-"){
+            $match_str .= "-";
+        }
+        else{
+            $match_str .= ".";
+        }
+    }
+    return $match_str;
+}
+
+## remove overhangs for the alignment - that the sequence for one read is missing
+## Ns at the two ends are also removed
+sub remove_overhang_fasta{
+    my ($align1, $align2) = @_;
+    my ($headGap, $tailGap);
+    # N or - at head
+    if($align1 =~ /^([\-N]*)/){
+        $headGap = length($1);
+    }
+    if($align2 =~ /^([\-N]*)/){
+        $headGap = length($1) if length($1)>$headGap;
+    }
+    # N or - at tail
+    if($align1 =~ /([\-N]*)$/){
+        $tailGap = length($1);
+    }
+    if($align2 =~ /([\-N]*)$/){
+        $tailGap = length($1) if length($1)>$tailGap;
+    }
+    # remove overhang at tail
+    if($tailGap>0){
+        $align1 =~ s/\S{$tailGap}$//;
+        $align2 =~ s/\S{$tailGap}$//;
+    }
+    # remove overhang at head
+    if($headGap>0){
+        $align1 =~ s/^\S{$headGap}//;
+        $align2 =~ s/^\S{$headGap}//;
+    }
+    return ($align1, $align2, $headGap, $tailGap);
+}
+
+
+# remove over hangs for qual
+sub remove_overhang_fastq{
+    my ($align1, $align2, $qual1, $qual2) = @_;
+    my ($headGap, $tailGap);
+    # N or - at head
+    if($align1 =~ /^([\-N]*)/){
+        $headGap = length($1);
+    }
+    if($align2 =~ /^([\-N]*)/){
+        $headGap = length($1) if length($1)>$headGap;
+    }
+    # N or - at tail
+    if($align1 =~ /([\-N]*)$/){
+        $tailGap = length($1);
+    }
+    if($align2 =~ /([\-N]*)$/){
+        $tailGap = length($1) if length($1)>$tailGap;
+    }
+    # remove overhang at tail
+    if($tailGap>0){
+        $align1 =~ s/\S{$tailGap}$//;
+        $align2 =~ s/\S{$tailGap}$//;
+        $qual1  =~ s/\S{$tailGap}$//;
+        $qual2  =~ s/\S{$tailGap}$//;
+    }
+    # remove overhang at head
+    if($headGap>0){
+        $align1 =~ s/^\S{$headGap}//;
+        $align2 =~ s/^\S{$headGap}//;
+        $qual1  =~ s/^\S{$headGap}//;
+        $qual2  =~ s/^\S{$headGap}//;
+    }
+    return ($align1, $align2, $qual1, $qual2, $headGap, $tailGap);
+}
+
+
+## recover original reads according to the alignment of raw reads
+# for FastA files
+sub recover_original_sequence_fasta{
+    my ($align1, $align2) = @_;
+    my @align_arr1 = split(//, $align1);
+    my @align_arr2 = split(//, $align2);
+    unless (scalar @align_arr1 == scalar @align_arr2){
+        warn "$align1 & $align2 are not of equal length\n";
+    }
+    my $original_seq = '';
+    for(my $i=0; $i<@align_arr1; $i++){
+        my $a = $align_arr1[$i];
+        my $b = $align_arr2[$i];
+        if($a eq $b){
+            $original_seq .= $a;
+        }
+        elsif($a eq 'T' && $b eq 'C'){
+            $original_seq .= 'C';
+        }
+        elsif($a eq 'G' && $b eq 'A'){
+            $original_seq .= 'G';
+        }
+        else{ # $a and $b don't match
+            if($a ne 'N' && $b ne 'N' && $a ne '-' && $b ne '-'){ # randomly pick up one
+                $original_seq .= int(rand(2))==0 ? $a : $b;
+            }
+            elsif($a ne 'N' && $a ne '-'){ # pick the non_N one
+                $original_seq .= $a;
+            }
+            elsif($b ne 'N' && $b ne '-'){
+                $original_seq .= $b;
+            }
+            else{
+                $original_seq .= 'N';
+            }
+        }
+    }
+    return $original_seq;
+}
+
+
+## recover original reads according to the alignment of raw reads
+## Quals are considered for FastQ files
+sub recover_original_sequence_fastq{
+    my ($align1, $align2, $qual1, $qual2) = @_;
+    my @align_arr1 = split(//, $align1);
+    my @align_arr2 = split(//, $align2);
+    my @qual_arr1  = split(//, $qual1);
+    my @qual_arr2  = split(//, $qual2);
+    unless (scalar @align_arr1 == scalar @align_arr2){
+        warn "$align1 & $align2 are not of equal length\n";
+    }
+    my $original_seq  = '';
+    my $combined_qual = '';
+    for(my $i=0; $i<@align_arr1; $i++){
+        my $a = $align_arr1[$i];
+        my $b = $align_arr2[$i];
+        if($a eq $b){
+            $original_seq .= $a;
+            $combined_qual .= &max_qual($qual_arr1[$i], $qual_arr2[$i]);
+        }
+        elsif($a eq 'T' && $b eq 'C'){
+            $original_seq .= 'C';
+            $combined_qual .= &max_qual($qual_arr1[$i], $qual_arr2[$i]);
+        }
+        elsif($a eq 'G' && $b eq 'A'){
+            $original_seq .= 'G';
+            $combined_qual .= &max_qual($qual_arr1[$i], $qual_arr2[$i]);
+        }
+        elsif($a eq '-'){
+            $original_seq .= $b;
+            $combined_qual .= $qual_arr2[$i];
+        }
+        elsif($b eq '-'){
+            $original_seq .= $a;
+            $combined_qual .= $qual_arr1[$i];
+        }else{ # $a and $b don't match: choose the one with better qual; if of equal qual, then randomly choose one.
+            if(ord($qual_arr1[$i]) > ord($qual_arr2[$i])){
+                $original_seq .= $a;
+            }
+            elsif(ord($qual_arr1[$i]) < ord($qual_arr2[$i])){
+                $original_seq .= $b;
+            }
+            else{  # randomly pick one if of equal qual
+                $original_seq .= int(rand(2))==0 ? $a : $b;
+            }
+            $combined_qual .= &max_qual($qual_arr1[$i], $qual_arr2[$i]);
+        }
+    }
+    return ($original_seq, $combined_qual);
+}
+
+
+## get max qual that are represented by letters
+sub max_qual{
+    my ($qual1, $qual2) = @_;
+    return ord($qual1) > ord($qual2) ? $qual1 : $qual2;
+}
+
+
+## remove "-" from the alignment when making FastA/FastQ file for recovered original sequences
+sub clean_gap{
+    my $seq = shift;
+    $seq =~ s/\-//g;
+    return $seq;
+}
+
+
+## parse alignment result to get original sequence, 
+sub parse_alignment_fasta{
+    my ($align1, $align2, $align_status) = @_;
+    
+    # remove overhangs in the alignment status string
+    $align_status =~ s/^\-+//;
+    $align_status =~ s/\-+$//;
+
+    my ($align1_trim, $align2_trim) = &remove_overhang_fasta($align1, $align2);    # remove overhangs because it cannot be used for recovering original reads
+    my $original_sequence = &recover_original_sequence_fasta($align1_trim, $align2_trim);    # get original read
+    my $length_trim = length($align1_trim);
+    my $match_count = 0;
+    while($align_status =~ /[\*\+]/g){
+        $match_count++;
+    }
+    
+    my $mismatch = $length_trim - $match_count;
+    my $identity;   # identity between two reads
+    if($length_trim > 0){
+        $identity = $match_count/$length_trim;
+    }
+    else{ # empty reads
+        warn "Error: length after trim is 0\n";
+        $identity = 0;
+    } 
+    
+    return ($original_sequence, $align1_trim, $align2_trim, $identity, $mismatch);
+}
+
+
+## parse alignment result to get original sequence, 
+sub parse_alignment_fastq{
+    my ($align1, $align2, $align_status, $qual1, $qual2) = @_;
+    
+    # remove overhangs in the alignment status string
+    $align_status =~ s/^\-+//;
+    $align_status =~ s/\-+$//;
+    my ($align1_trim, $align2_trim, $qual1_trim, $qual2_trim) = &remove_overhang_fastq($align1, $align2, &map_qual_to_align($qual1, $align1), &map_qual_to_align($qual2, $align2));    # remove overhangs because it cannot be used for recovering original reads
+    
+    my ($original_sequence, $combined_qual) = &recover_original_sequence_fastq($align1_trim, $align2_trim, $qual1_trim, $qual2_trim);    # get original read
+    my $length_trim = length($align1_trim);
+    my $match_count = 0;
+    while($align_status =~ /[\*\+]/g){
+        $match_count++;
+    }
+    
+    my $mismatch = $length_trim - $match_count;
+    my $identity;   # identity between two reads
+    if($length_trim > 0){
+        $identity = $match_count/$length_trim;
+    }
+    else{ # empty reads
+        warn "Error: length after trim is 0\n";
+        $identity = 0;
+    } 
+    
+    return ($original_sequence, $align1_trim, $align2_trim, $combined_qual, $qual1_trim, $qual2_trim, $identity, $mismatch);
+}
+
+
+# maps quals to alignment (insert some gaps - based on alignment, thus the positions for each qual remains correct)
+sub map_qual_to_align{
+    my ($qual, $align) = @_;
+    my @qual_arr = split(//, $qual);
+    my @align_arr = split(//, $align);
+    my $qual_aligned = '';
+    while(my $base = shift @align_arr){
+        if($base eq '-'){
+            $qual_aligned .= '-';
+        }
+        else{
+            $qual_aligned .= shift @qual_arr;
+        }
+    }
+    return $qual_aligned;
+}
+
+    
+## get the reverse complement sequence
+sub rev_comp{
+    my $seq = shift;
+    $seq =~ tr/ATGCatgc/TACGtacg/;
+    return reverse($seq);
+}
+
+
+## read reference sequences into hash table
+sub read_chromosomes{
+    my ($indexed_reference, $hashP) = @_;
+    my $reference_dir;
+    if($indexed_reference =~ /^(\S+)\/[^\/]*$/){
+        $reference_dir = $1;
+    }
+    else{
+        $reference_dir = $work_dir;
+    }
+    
+    my @reference_files = glob("$reference_dir/*.fa $reference_dir/*.fasta");
+    my $chr_num = 0;
+    my $chr_total_len = 0;
+    
+    my $chr_len_stat = '';
+    
+    if(@reference_files > 0){
+        foreach my $reference_file (@reference_files){
+            warn "\nReading chromosomes into memory ...\n";
+            open(REF, $reference_file)||die"Cannot open $reference_file\n";
+            $/ = ">";
+            while(<REF>){
+                s/>//;
+                if(/^(\S+)[^\n]*\n(.*)$/s){
+                    my ($name, $seq) = ($1, $2);
+                    $seq =~ s/\W//g;
+                    $seq = uc $seq;
+                    my $seq_len = length($seq);
+                    if(defined ${$hashP}{$name}){
+                        warn "Error: check reference with name $name. It has been definied more than one time\n";
+                    }
+                    else{
+                        ${$hashP}{$name} = $seq;
+                        warn "  $name\t" . $seq_len . " bp\n";
+                        $chr_num++;
+                        $chr_total_len += $seq_len;
+                        $chr_len_stat .= "\@SQ\tSN:$name\tLN:$seq_len\n";
+                    }
+                }
+            }
+            $/ = "\n";
+            close REF;
+        }
+    }
+    else{
+        warn "Failed to read reference files (ended with .fa or .fasta) from directory $reference_dir\n";
+    }
+    warn "\nAll $chr_num chromosomes have been read into memory, with total length $chr_total_len bp\n\n";
+    return $chr_len_stat;
+}
+
+
+## calculate hemming distance
+sub hemming_dist{
+    my $actual_seq  = shift or die "Missing actual sequence";
+    my $ref_seq     = shift or die "Missing reference sequence";
+    my @actual_seq  = split(//,$actual_seq);
+    my @ref_seq     = split(//,$ref_seq);
+    my $matches = 0;
+    foreach (0..$#actual_seq){
+        ++$matches if ($actual_seq[$_] eq $ref_seq[$_]);
+    }
+    my $hd = scalar @actual_seq - $matches;
+    return $hd;
+}
+
+
+## to make mismatch string
+sub make_mismatch_string{
+    my $actual_seq = shift or die "Missing actual sequence";
+    my $ref_seq = shift or die "Missing reference sequence";
+    my $XX_tag = "XX:Z:";
+    my $tmp = ($actual_seq ^ $ref_seq);                    # Bitwise comparison
+    my $prev_mm_pos = 0;
+    while($tmp =~ /[^\0]/g){                               # Where bitwise comparison showed a difference
+        my $nuc_match = pos($tmp) - $prev_mm_pos - 1;        # Generate number of nucleotide that matches since last mismatch
+        my $nuc_mm = substr($ref_seq, pos($tmp) - 1, 1) if pos($tmp) <= length($ref_seq);  # Obtain reference nucleotide that was different from the actual read
+        $XX_tag .= "$nuc_match" if $nuc_match > 0;           # Ignore if mismatches are adjacent to each other
+        $XX_tag .= "$nuc_mm" if defined $nuc_mm;             # Ignore if there is no mismatch (prevents uninitialized string concatenation)
+        $prev_mm_pos = pos($tmp);                            # Position of last mismatch
+    }
+    my $end_matches = length($ref_seq) - $prev_mm_pos;     # Provides number of matches from last mismatch till end of sequence
+    $XX_tag .= "$end_matches" if $end_matches > 0;         # Ignore if mismatch is at the end of sequence
+    return $XX_tag;
+}
+
+
+## perform methylation calling
+sub perform_methylation_call{
+    my ($bowtieOutput, $align_file) = @_;
+    
+    #1:1101:1917:2145 - chr18 69545639 TCCCTTCTCATGACCTGGCTCGTTGTGAACGCTGCCCTG IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII 0 1:A>N
+    # when -, read sequence is reversed.
+    open(BOWTIE, $bowtieOutput)||die"Cannot open $bowtieOutput\n";
+    #1:1101:1548:2184 GAATCATGAGTGTTTACTTCNCATAAGAAAGT GAATTATGAGTGTTTATTTTATATAAGAAAGT AAATCATAAATATTTACTTCTCATAAAAAAAT 102 10 0.901960784313726
+    open(ALIGN,  $align_file)     ||die"Cannot open $align_file\n";
+    
+    ## to store align information
+    # my $tmp_id = '';
+    # my $tmp_align1 = '';
+    # my $tmp_align2 = '';
+    # # the 7th column is the number of mismatches
+    #HWI-ST958:96:1:1101:2029:2226#0/  -  chr2  98667127  ACGGAAGGACCTGGAATATGGCGAGAAAACTGAAAATCACGGAAAATGAGAAATACACACTTTAGGACGTGAAATATGGCGAGGAAAACTGAAAAAGGTGG A=DDDDCDECCC>DDEFD?DDBEBIGEHGHDHIJJIGGHFBCGGFJJJIHGGHJGEGJJIGGHHFC8HC>IGHGGHEJIIIIIIIIGGHHGHHFFFFF@CB   0       98:T>G
+    #HWI-ST958:96:1:1101:2029:2226#0/  +  chr9  3024086   CCACCTTTTTCAGTTTTCCTCGCCATATTTCACGTCCTAAAGTGTGTATTTCTCATTTTCCGTGATTTTCAGTTTTCTCGCCATATTCCAGGTCCTTCCGT BC@FFFFFHHGHHGGIIIIIIIIJEHGGHGI>CH8CFHHGGIJJGEGJHGGHIJJJFGGCBFHGGIJJIHDHGHEGIBEBDD?DFEDD>CCCEDCDDDD=A   0       96:A>T,98:A>C
+
+    while(my $ln = <BOWTIE>){
+        my @arr = split(/\s+/, $ln);
+        my ($core_name, $strand, $chr, $start, $read) = ($arr[0], $arr[1], $arr[2], $arr[3], $arr[4]);
+        $counting{total_mappable_read}++;
+        
+        my $unique_best_exist = 1;
+        if(!eof(BOWTIE)){
+            my $next_ln = <BOWTIE>;
+            my @arr2 = split(/\s+/, $next_ln);
+            my ($core_name2, $strand2, $chr2, $start2, $read2) = ($arr2[0], $arr2[1], $arr2[2], $arr2[3], $arr2[4]);
+        
+            if($core_name eq $core_name2){
+                my $mismatch1 = 0;
+                my $mismatch2 = 0;
+                if(@arr == 8){
+                    while($arr[-1] =~ /\,/g){
+                        $mismatch1++;
+                    }
+                }
+                if(@arr2 == 8){
+                    while($arr2[-1] =~ /\,/g){
+                        $mismatch2++;
+                    }
+                }
+                
+                if($mismatch1<$mismatch2){
+                    $counting{unique_mappable_read}++;
+                }
+                else{
+                    $unique_best_exist = 0;
+                }
+            }
+            else{
+                $counting{unique_mappable_read}++;
+                seek(BOWTIE, -length($next_ln), 1);
+            }
+        }
+        
+        ## exit from this loop if unique best alignment doesn't exist
+        next unless $unique_best_exist == 1;
+        
+        $start += 1; # change the position from 0-coordinated to 1-coordinated
+        # bugs if $start<3; temp solution:
+        next if $start<3;
+        my $read_length = length($read);
+        # get reference fragment
+        # the upstream 2 bp, and downstream 2 bp are included thus CpG, CHG or CHH context can be determined
+        #next unless $chromosomes{$chr};
+        my $ref_seq = substr($chromosomes{$chr}, $start-3, $read_length+4);
+        #print "my $ref_seq = substr(\$chromosomes{$chr}, $start-3, $read_length+4)\n";
+        #warn "chr:$chr:$start-$read_length:\t$ref_seq\n";
+        if( length($ref_seq)<=10 ){
+           warn "CAN NOT get seq from $chr", $start-3, $read_length+4, "\n";
+           next;
+        }
+                        
+        # get read1 and read2 sequence based on core name
+        my ($align1, $align2);
+        my $check_status = 0;
+        #
+        while(<ALIGN>){
+            my @alignArr = split;
+            if($alignArr[0] eq $core_name){
+                $align1 = $alignArr[2];
+                $align2 = $alignArr[3];
+                $check_status = 1;
+                # $tmp_id = $core_name;
+                # $tmp_align1 = $align1;
+                # $tmp_align2 = $align2;
+                last; # store the file handle here once the corresponding read1 and read2 are found
+            }
+        }
+        
+        # check if the core name in sam file could also be found in alignment file
+        if($check_status == 0){
+            warn "Check $core_name: it can be found in $bowtieOutput, but cannot be found in $align_file\n";
+        }
+        
+        # methylation calling
+        #my ($identifier,$sequence_actually_observed,$genomic_sequence,$read_conversion)
+        my ($flag1, $flag2);
+        my ($methy_call1, $methy_call2);
+        if($strand eq '+'){
+            $methy_call1 = &methylation_call($ref_seq, $align1, 'CT');
+            $methy_call2 = &methylation_call($ref_seq, $align2, 'GA');
+            $flag1 = 0;
+            $flag2 = 0;
+            #print "$core_name +\n$ref_seq\n  $align1\n  $methy_call1\n  $align2\n  $methy_call2\n\n";
+        }
+        elsif($strand eq '-'){
+            my $align1_rc = &rev_comp($align1);
+            my $align2_rc = &rev_comp($align2);
+            $methy_call1 = &methylation_call($ref_seq, $align1_rc, 'GA');
+            $methy_call2 = &methylation_call($ref_seq, $align2_rc, 'CT');
+            $flag1 = 16;
+            $flag2 = 16;
+            #print "$core_name -\n$ref_seq\n  ";
+            #print $align1_rc . "\n  $methy_call1\n  ";
+            #print $align2_rc . "\n  $methy_call2\n\n";
+        }
+        else{
+            warn "Strand must be + or -\n";
+        }
+        
+        my $mapq = 255;
+        my $cigar1 = length($align1) . "M";
+        my $cigar2 = length($align2) . "M";
+        
+        my $rnext = "*";                                                    # Paired-end variable
+        my $pnext = 0;                                                      # Paired-end variable
+        my $tlen  = 0; 
+        $ref_seq = substr($ref_seq, 2, length($ref_seq) - 4);            # Removes additional nucleotides from the 5' and 3' end
+        
+        my ($actual_seq1, $actual_seq2);
+        my $qual1 = 'I' x length($align1);
+        my $qual2 = 'I' x length($align2);
+        
+        if($strand eq '+'){
+            $actual_seq1 = $align1;                                 # Sequence represented on the forward genomic strand
+            $actual_seq2 = $align2;                                 # Required for comparison with actual sequence
+       
+        }elsif ($strand eq '-'){
+            $actual_seq1 = &rev_comp($align1);                        # Sequence represented on the forward genomic strand
+            $actual_seq2 = &rev_comp($align2);                        # Required for comparison with actual sequence
+            $qual1       = reverse $qual1;                          # if the sequence was reverse-complemented the quality string needs to be reversed as well
+            $qual2       = reverse $qual2;
+        }
+
+        #####
+        #print "$core_name\t$actual_seq1\t$actual_seq2\t$ref_seq\n";
+        my $hemming_dist1 = hemming_dist($actual_seq1,$ref_seq);    # Edit distance to the reference, i.e. minimal number of one-nucleotide edits needed to transform the read string
+        my $hemming_dist2 = hemming_dist($actual_seq2,$ref_seq);                                                                    # into the reference string. hemming_dist()
+        my $NM_tag1 = "NM:i:$hemming_dist1";                        # Optional tag NM: edit distance based on nucleotide differences
+        my $NM_tag2 = "NM:i:$hemming_dist2";
+        
+        #####
+        my $XX_tag1 = make_mismatch_string($actual_seq1, $ref_seq); # Optional tag XX: string providing mismatched reference bases in the alignment (NO indel information!)
+        my $XX_tag2 = make_mismatch_string($actual_seq1, $ref_seq);
+        
+        #####
+        my ($XM_tag1, $XM_tag2);                                    # Optional tag XM: Methylation Call String
+        $XM_tag1 = "XM:Z:$methy_call1";
+        $XM_tag2 = "XM:Z:$methy_call2";
+
+        #####
+        #my $XR_tag = "XR:Z:$read_conversion";                      # Optional tag XR: Read Conversion
+        my $XR_tag1 = "XR:Z:CT";
+        my $XR_tag2 = "XR:Z:GA";
+        #####
+
+        #my $XG_tag = "XG:Z:$genome_conversion";                    # Optional tag XG: Genome Conversion
+        my $XG_tag1 = "XG:Z:CT";
+        my $XG_tag2 = "XG:Z:GA";        
+        
+        # result for read1
+        print SAMOUT join("\t",("$core_name\#/1",$flag1,$chr,$start,$mapq,$cigar1,$rnext,$pnext,$tlen,$actual_seq1,$qual1,$NM_tag1,$XX_tag1,$XM_tag1,$XR_tag1,$XG_tag1)),"\n";
+        print SAMOUT join("\t",("$core_name\#/2",$flag2,$chr,$start,$mapq,$cigar2,$rnext,$pnext,$tlen,$actual_seq2,$qual2,$NM_tag2,$XX_tag2,$XM_tag2,$XR_tag2,$XG_tag2)),"\n";
+        
+    }
+    
+    close BOWTIE;
+    close ALIGN;
+}
+
+##Methylation calling subroutine if Bowtie 2 is used in running HBS Mapper
+sub perform_methylation_call2{
+
+    my ($bowtieOutput, $align_file) = @_;
+    open(BOWTIE, $bowtieOutput)||die"Cannot open $bowtieOutput\n";
+    open(ALIGN,  $align_file)     ||die"Cannot open $align_file\n";
+    my @mult;
+    
+    while(my $bow = <BOWTIE>){
+        if ($bow !~ /^@/){
+            my ($core) = split(/\t/,$bow);
+            my @bow_arr = split(/\t/,$bow);
+            my $len = scalar @bow_arr;
+            
+            next if $bow_arr[1] == 4;   # unaligned sequences
+            ## 19 columns in the bowtie output line represents that the read has a single alignment and  
+            ## 20 represents multiple alignments (2 alignments in this case as the a default value of 2 is provided through the -k option to the Bowtie 2 program)
+            if ($len == 19){
+                #print test_out "$core\tSingle Alignment\n";
+                #print test_out "$core\t$bow_arr[11]\t$bow_arr[12]\n\n";
+                $counting{total_mappable_read}++;
+                $counting{unique_mappable_read}++;
+                &bowtie2_single_aln($bow);
+            }
+            # if a read is aligned to multiple locations, check the XS tag to see if the first alignment is the unique best one
+            # if unique best alignment exist, then output it
+            # else, discard it as non-uniquely mappable reads
+            #HWI-ST958:96:1:1101:1545:2223#0/        16      chr4    52142873        1       101M    *       0       0       AACGATCCATACTTATCTCCTTGTACTAAGGTCAAATCTAAGTGGATCAAGGAACCTCACATAAAACCAGAGACACTGAAACTTATAGAGGAGAAAGTGGG <35+5354;(AA;4A?52@7.=4.484=A:)F?4>ADBD@?8<B>DB<HGFCGFF@C<C9>@F@@C<9==23,399J?HIA:<AEFE?FDDDBDFFD<@B@AS:i:-3  XS:i:-3 XN:i:0  XM:i:1  XO:i:0  XG:i:0  NM:i:1  MD:Z:1T99       YT:Z:UU
+            #HWI-ST958:96:1:1101:1545:2223#0/        256     chr4    103591841       1       101M    *       0       0       CCCACTTTCTCCTCTATAAGTTTCAGTGTCTCTGGTTTTATGTGAGGTTCCTTGATCCACTTAGATTTGACCTTAGTACAAGGAGATAAGTATGGATCGTT @B@<DFFDBDDDF?EFEA<:AIH?J993,32==9<C@@F@>9C<C@FFGCFGH<BD>B<8?@DBDA>4?F):A=484.4=.7@25?A4;AA(;4535+53<AS:i:-3  XS:i:-3 XN:i:0  XM:i:1  XO:i:0  XG:i:0  NM:i:1  MD:Z:99A1       YT:Z:UU
+
+            elsif($len == 20){
+                push(@mult, $bow);
+                if (scalar @mult == 2){
+                    my @align = split(/\s+/, $mult[0]);
+                    my $as_tag = $align[11];
+                    my $xs_tag = $align[12];
+                    $as_tag =~ s/^.*\://;
+                    $xs_tag =~ s/^.*\://;
+                    $counting{total_mappable_read}++;
+                    # unique best alignment exists
+                    if ($as_tag>$xs_tag){
+                        $counting{unique_mappable_read}++;
+                        $mult[0] =~ s/$xs_tag\s+//;
+                        &bowtie2_single_aln($mult[0]);
+                    }
+                    else{
+                        ;
+                    }
+                    
+                    
+                    
+                    # &bowtie2_multiple_aln($mult[0],$mult[1]);
+                    @mult = ();
+                    
+                }
+            }
+            else{
+                ;
+            }
+        }
+    }
+    
+    close BOWTIE;
+    close ALIGN;
+}
+
+## Performs methylation calling in case of single alignment per read. 
+sub bowtie2_single_aln{
+    my ($aln1) = @_;
+    my ($core_name1, $flag1, $chr1, $start1, $mapq1, $cigar1, $rnext1, $pnext1, $tlen1, $read1, $qual1, $AS1, $XN1, $XM1, $XO1, $XG1, $NM1, $MD1, $YT1) = split(/\t/,$aln1);
+    #print test_out "$core_name1\t$flag1\t$cigar1\n\n";
+
+    my ($align1, $align2, $original);
+    my $check_status = 0;
+    my ($processed_align1,$processed_align2) = '';
+    
+    ## Find the raw reads (Read 1 and 2) for each mapped original read)
+    if (grep { $_ eq $chr1 } keys %chromosomes ) {
+    
+        while (my $aln_line = <ALIGN>){
+    
+            my @alnarr = split(/\t/,$aln_line);
+            #print "$alnarr[0]\n";
+            if ($alnarr[0] eq $core_name1){
+                $original = $alnarr[1];
+                $align1 = $alnarr[2];
+                $align2 = $alnarr[3];
+                $check_status = 1;
+                last;
+            }
+        }
+
+        if($check_status == 0){
+            print test_out "Check $core_name1: it can't be found\n\n";
+        }
+
+        ## Flag 0 represents an alignment to the positive strand
+        my ($methy_call1, $methy_call2);
+        if ($flag1 == 0){
+            ## Indels are processed using the read processing subroutine 
+            $processed_align1 = &read_processing2($cigar1, $align1);
+            $processed_align2 = &read_processing2($cigar1, $align2);
+            #print test_out "Processed read 1 and 2\n$processed_align1\n$processed_align2\n\n";
+            
+        ## Flag 16 represents an alignment to the negative strand and hence the reverse complement is needed before it can be mapped to the reference genome for methylation calling
+        }
+        elsif($flag1 == 16){
+            my $align1_rc = &rev_comp($align1);
+            my $align2_rc = &rev_comp($align2);
+            my $ori_rc = &rev_comp($original);
+
+            $processed_align1 = &read_processing2($cigar1, $align1_rc);
+            $processed_align2 = &read_processing2($cigar1, $align2_rc);
+            
+            #print test_out "Processed read 1 and 2\n$processed_align1\n$processed_align2\n\n";
+#             $methy_call1 = &methylation_call($ref_seq, $align1_rc, 'GA');
+#             $methy_call2 = &methylation_call($ref_seq, $align2_rc, 'CT');
+        }
+        else{
+            warn "Unrecognized Bowtie Flag for $core_name1\n";
+        }
+        
+        ## The length of the processed read is acquired to reference sequence segment
+        my $read_length = length($processed_align1);
+        #print test_out "Read length:\t$read_length\n";
+        my $ref_seq = substr($chromosomes{$chr1}, $start1-3, $read_length+4);
+	return unless ( length($ref_seq) == ($read_length+4) );	# add by realzhang
+        #print test_out "Ref:\t$ref_seq\n\n";
+        
+        ## Flag 0   --> Aligned to the positive strand of the reference genome 
+        ## Flag 16  --> Aligned to the negative strand of the reference genome
+        
+        my ($align1_flag, $align2_flag);
+        if ($flag1 == 0){
+            $methy_call1 = &methylation_call($ref_seq, $processed_align1, 'CT');
+            $methy_call2 = &methylation_call($ref_seq, $processed_align2, 'GA');
+        }
+        elsif ($flag1 == 16){
+            $methy_call1 = &methylation_call($ref_seq, $processed_align1, 'GA');
+            $methy_call2 = &methylation_call($ref_seq, $processed_align2, 'CT');
+        }
+        else{
+            warn "The flat for SAM file is expected to be 0 or 16\n";
+            exit;
+        }
+        
+        #####
+        my ($XM_tag1, $XM_tag2);                                    # Optional tag XM: Methylation Call String
+        $XM_tag1 = "XM:Z:$methy_call1";
+        $XM_tag2 = "XM:Z:$methy_call2";        
+        
+        #####
+        #my $XR_tag = "XR:Z:$read_conversion";                      # Optional tag XR: Read Conversion
+        my $XR_tag1 = "XR:Z:CT";
+        my $XR_tag2 = "XR:Z:GA";
+        #####
+
+        #my $XG_tag = "XG:Z:$genome_conversion";                    # Optional tag XG: Genome Conversion
+        my $XG_tag1 = "XG:Z:CT";
+        my $XG_tag2 = "XG:Z:GA"; 
+        
+        my $qual = 'I' x length($processed_align1);
+        
+	$cigar1 = length($processed_align1) . 'M' if ( $cigar1 =~ /\d*I/ ) ; # remove I from cigar; by realzhang
+	$cigar1 = length($processed_align1) . 'M' if ( $cigar1 =~ /\d*D/ ) ; # remove I from cigar; by realzhang
+
+        print SAMOUT join("\t",("$core_name1\#/1",$flag1,$chr1,$start1,$mapq1,$cigar1,$rnext1,$pnext1,$tlen1,$processed_align1,$qual,$NM1,$MD1,$XM_tag1,$XR_tag1,$XG_tag1)),"\n";
+        print SAMOUT join("\t",("$core_name1\#/2",$flag1,$chr1,$start1,$mapq1,$cigar1,$rnext1,$pnext1,$tlen1,$processed_align2,$qual,$NM1,$MD1,$XM_tag2,$XR_tag2,$XG_tag2)),"\n";
+        
+#         print SAMOUT join("\t",("$core_name\#/1",$flag1,$chr,$start,$mapq,$cigar1,$rnext,$pnext,$tlen,$actual_seq1,$qual1,$NM_tag1,$XX_tag1,$XM_tag1,$XR_tag1,$XG_tag1)),"\n";
+#         print SAMOUT join("\t",("$core_name\#/2",$flag2,$chr,$start,$mapq,$cigar2,$rnext,$pnext,$tlen,$actual_seq2,$qual2,$NM_tag2,$XX_tag2,$XM_tag2,$XR_tag2,$XG_tag2)),"\n";
+    }
+}
+    
+
+## Performs methylation calling if bowtie 2 reports two alignments for the same read 
+sub bowtie2_multiple_aln{
+    my ($aln1, $aln2) = @_;
+    #print "$aln1\n$aln2\n\n";
+    
+    my ($core_name1, $flag1, $chr1, $start1, $mapq1, $cigar1, $rnext1, $pnext1, $tlen1, $read1, $qual1, $AS1, $XS1, $XN1, $XM1, $XO1, $XG1, $NM1, $MD1, $YT1) = split(/\t/,$aln1);
+    my ($core_name2, $flag2, $chr2, $start2, $mapq2, $cigar2, $rnext2, $pnext2, $tlen2, $read2, $qual2, $AS2, $XS2, $XN2, $XM2, $XO2, $XG2, $NM2, $MD2, $YT2) = split(/\t/,$aln2);
+     
+    my @as1 = split(':',$AS1);
+    my @as2 = split(':',$AS2);
+    my @xs1 = split(':',$XS1);
+    my @xs2 = split(':',$XS2);
+    
+    if ($core_name1 eq $core_name2){
+
+        ## If both the alignments have the same alignment score then that read is discarded. 
+
+        if ($as1[2] == $as2[2]){
+            #print test_out "############### $core_name1 ----> DISCARDED #################\n\n";
+        }
+        elsif($as1[2] != $xs1[2]){
+            ## If the alignment score is the AS column and the XS column are equal that means that alignment is not the best of the two. 
+            #print test_out "First Alignment Choosen\t$core_name1\n";
+            # According to the gap length mentioned in the MD tag, read length needs to be redefined so as to extract the reference sequence with the correct length
+            
+            $counting{total_mappable_read}++;
+            my ($align1, $align2, $original);
+            my $check_status = 0;
+            my ($processed_align1,$processed_align2) = '';
+            
+            if (grep { $_ eq $chr1 } keys %chromosomes ) {
+            
+                while (my $aln_line = <ALIGN>){
+                    my @alnarr = split(/\t/,$aln_line);
+                    #print "$alnarr[0]\n";
+                    if ($alnarr[0] eq $core_name2){
+                        $original = $alnarr[1];
+                        $align1 = $alnarr[2];
+                        $align2 = $alnarr[3];
+                        $check_status = 1;
+                        last;
+                    }
+                }
+            
+                if($check_status == 0){
+                    print test_out "Check $core_name1: it can't be found\n\n";
+                }
+        
+                my ($methy_call1, $methy_call2);
+                if ($flag1 == 0){
+                    $processed_align1 = &read_processing2($cigar1, $align1);
+                    $processed_align2 = &read_processing2($cigar1, $align2);
+                    #print test_out "Processed read 1 and 2\n$processed_align1\n$processed_align2\n\n";
+                }
+                elsif($flag1 == 16){
+                    my $align1_rc = &rev_comp($align1);
+                    my $align2_rc = &rev_comp($align2);
+                    my $ori_rc = &rev_comp($original);
+
+                    $processed_align1 = &read_processing2($cigar1, $align1_rc);
+                    $processed_align2 = &read_processing2($cigar1, $align2_rc);
+                    #print test_out "Processed read 1 and 2\n$processed_align1\n$processed_align2\n\n";
+                }
+                elsif($flag1 == 256){
+                    $processed_align1 = &read_processing2($cigar1, $align1);
+                    $processed_align2 = &read_processing2($cigar1, $align2);
+                    #print test_out "Processed read 1 and 2\n$processed_align1\n$processed_align2\n\n";
+                }
+                elsif($flag1 == 272){
+                    my $align1_rc = &rev_comp($align1);
+                    my $align2_rc = &rev_comp($align2);
+                    my $ori_rc = &rev_comp($original);
+    
+                    $processed_align1 = &read_processing2($cigar1, $align1_rc);
+                    $processed_align2 = &read_processing2($cigar1, $align2_rc);    
+                    #print test_out "Processed read 1 and 2\n$processed_align1\n$processed_align2\n\n";        
+                }
+                else{
+                    warn "Unrecognized Bowtie Flag for $core_name1\n";
+                }
+
+                my $read_length = length($processed_align1);
+                #print test_out "Read length:\t$read_length\n";
+                my $ref_seq = substr($chromosomes{$chr1}, $start1-3, $read_length+4);
+                #print test_out "Ref:\t$ref_seq\n\n";
+		return unless ( length($ref_seq) == ($read_length+4) );	# add by realzhang
+            
+
+                ## Flag 0   --> Aligned to the positive strand of the reference genome 
+                ## Flag 16  --> Aligned to the negative strand of the reference genome
+                ## Flag 256 --> Aligned to the positive strand of the reference genome and is one of multiple (two in this case) alignments
+                ## Flag 272 --> Aligned to the negative strand of the reference genome and is one of multiple (two in this case) alignments
+                
+                if ($flag1 == 0 or $flag1 == 256){
+                    $methy_call1 = &methylation_call($ref_seq, $processed_align1, 'CT');
+                    $methy_call2 = &methylation_call($ref_seq, $processed_align2, 'GA');
+                }
+                elsif ($flag1 == 16 or $flag1 == 272){
+                    $methy_call1 = &methylation_call($ref_seq, $processed_align1, 'GA');
+                    $methy_call2 = &methylation_call($ref_seq, $processed_align2, 'CT');
+                }
+                else{
+                    warn "Unrecoginized SAM flag: $flag1\n";
+                    exit;
+                }
+                
+                #####
+                my ($XM_tag1, $XM_tag2);                                    # Optional tag XM: Methylation Call String
+                $XM_tag1 = "XM:Z:$methy_call1";
+                $XM_tag2 = "XM:Z:$methy_call2";        
+        
+        
+                #####
+                #my $XR_tag = "XR:Z:$read_conversion";                      # Optional tag XR: Read Conversion
+                my $XR_tag1 = "XR:Z:CT";
+                my $XR_tag2 = "XR:Z:GA";
+                #####
+
+                #my $XG_tag = "XG:Z:$genome_conversion";                    # Optional tag XG: Genome Conversion
+                my $XG_tag1 = "XG:Z:CT";
+                my $XG_tag2 = "XG:Z:GA"; 
+        
+                my $qual = 'I' x length($processed_align1);
+
+		$cigar1 = length($processed_align1) . 'M' if ( $cigar1 =~ /\d*I/ ) ; # remove I from cigar; by realzhang
+		$cigar1 = length($processed_align1) . 'M' if ( $cigar1 =~ /\d*D/ ) ; # remove I from cigar; by realzhang
+
+                print SAMOUT join("\t",("$core_name1\#/1",$flag1,$chr1,$start1,$mapq1,$cigar1,$rnext1,$pnext1,$tlen1,$processed_align1,$qual,$NM1,$MD1,$XM_tag1,$XR_tag1,$XG_tag1)),"\n";
+                print SAMOUT join("\t",("$core_name1\#/2",$flag1,$chr1,$start1,$mapq1,$cigar1,$rnext1,$pnext1,$tlen1,$processed_align2,$qual,$NM1,$MD1,$XM_tag2,$XR_tag2,$XG_tag2)),"\n";
+                
+            }
+        }
+        elsif($as2[2] != $xs2[2]){
+            ## If the alignment score is the AS column and the XS column are equal that means that alignment is not the best of the two.
+            #print test_out "Second Alignment Choosen\t$core_name2\n";
+            
+            $counting{total_mappable_read}++;
+            my ($align1, $align2, $original);
+            my $check_status = 0;
+            my ($processed_align1,$processed_align2) = '';
+            
+            if (grep { $_ eq $chr2 } keys %chromosomes ) {
+                
+                while (my $aln_line = <ALIGN>){
+                    my @alnarr = split(/\t/,$aln_line);
+                    #print "$alnarr[0]\n";
+                    if ($alnarr[0] eq $core_name2){
+                        $original = $alnarr[1];
+                        $align1 = $alnarr[2];
+                        $align2 = $alnarr[3];
+                        $check_status = 1;
+                        last;
+                    }
+                }
+            
+                if($check_status == 0){
+                    print test_out "Check $core_name2: it can't be found\n\n";
+                }
+        
+                my ($methy_call1, $methy_call2);
+                if ($flag2 == 0){
+                    $processed_align1 = &read_processing2($cigar2, $align1);
+                    $processed_align2 = &read_processing2($cigar2, $align2);
+                    #print test_out "Processed read 1 and 2\n$processed_align1\n$processed_align2\n\n";
+                }
+                elsif($flag2 == 16){
+                    my $align1_rc = &rev_comp($align1);
+                    my $align2_rc = &rev_comp($align2);
+                    my $ori_rc = &rev_comp($original);
+                    $processed_align1 = &read_processing2($cigar2, $align1_rc);
+                    $processed_align2 = &read_processing2($cigar2, $align2_rc);
+                    #print test_out "Processed read 1 and 2\n$processed_align1\n$processed_align2\n\n";
+                }
+                elsif($flag2 == 256){
+                    $processed_align1 = &read_processing2($cigar2, $align1);
+                    $processed_align2 = &read_processing2($cigar2, $align2);
+                    #print test_out "Processed read 1 and 2\n$processed_align1\n$processed_align2\n\n";
+                }
+                elsif($flag2 == 272){
+                    my $align1_rc = &rev_comp($align1);
+                    my $align2_rc = &rev_comp($align2);
+                    my $ori_rc = &rev_comp($original);
+                    $processed_align1 = &read_processing2($cigar2, $align1_rc);
+                    $processed_align2 = &read_processing2($cigar2, $align2_rc);    
+                    #print test_out "Processed read 1 and 2\n$processed_align1\n$processed_align2\n\n";        
+                }
+                else{
+                    warn "Unrecognized Bowtie Flag for $core_name1 or $core_name2\n";
+                }
+                
+                my $read_length = length($processed_align1);
+                #print test_out "Read length:\t$read_length\n";
+                my $ref_seq = substr($chromosomes{$chr2}, $start2-3, $read_length+4);
+
+		return unless ( length($ref_seq) == ($read_length+4) );	# add by realzhang
+
+                #print test_out "Ref:\t$ref_seq\n\n";
+                
+                ## Flag 0   --> Aligned to the positive strand of the reference genome 
+                ## Flag 16  --> Aligned to the negative strand of the reference genome
+                ## Flag 256 --> Aligned to the positive strand of the reference genome and is one of multiple (two in this case) alignments
+                ## Flag 272 --> Aligned to the negative strand of the reference genome and is one of multiple (two in this case) alignments                
+                
+                if ($flag2 == 0 or $flag2 == 256){
+                    $methy_call1 = &methylation_call($ref_seq, $processed_align1, 'CT');
+                    $methy_call2 = &methylation_call($ref_seq, $processed_align2, 'GA');
+                }
+                elsif ($flag2 == 16 or $flag2 == 272){
+                    $methy_call1 = &methylation_call($ref_seq, $processed_align1, 'GA');
+                    $methy_call2 = &methylation_call($ref_seq, $processed_align2, 'CT');
+                }
+                else{
+                    warn "Unrecoginized flag: $flag2\n";
+                    exit;
+                }
+                
+                #####
+                my ($XM_tag1, $XM_tag2);                                    # Optional tag XM: Methylation Call String
+                $XM_tag1 = "XM:Z:$methy_call1";
+                $XM_tag2 = "XM:Z:$methy_call2";        
+        
+                #####
+                #my $XR_tag = "XR:Z:$read_conversion";                      # Optional tag XR: Read Conversion
+                my $XR_tag1 = "XR:Z:CT";
+                my $XR_tag2 = "XR:Z:GA";
+                #####
+
+                #my $XG_tag = "XG:Z:$genome_conversion";                    # Optional tag XG: Genome Conversion
+                my $XG_tag1 = "XG:Z:CT";
+                my $XG_tag2 = "XG:Z:GA"; 
+        
+                my $qual = 'I' x length($processed_align1);
+
+		# remove insertion (I) from cigar, which is imported by bowtie2. This may cause SAM format error (cigar length != read length) by realzhang
+		$cigar2 = length($processed_align1) . 'M' if ( $cigar2 =~ /\d*I/ ) ; # remove I from cigar; by realzhang
+		$cigar2 = length($processed_align1) . 'M' if ( $cigar2 =~ /\d*D/ ) ; # remove I from cigar; by realzhang
+        
+                print SAMOUT join("\t",("$core_name1\#/1",$flag2,$chr2,$start2,$mapq2,$cigar2,$rnext2,$pnext2,$tlen2,$processed_align1,$qual,$NM2,$MD2,$XM_tag1,$XR_tag1,$XG_tag1)),"\n";
+                print SAMOUT join("\t",("$core_name1\#/2",$flag2,$chr2,$start2,$mapq2,$cigar2,$rnext2,$pnext2,$tlen2,$processed_align2,$qual,$NM2,$MD2,$XM_tag2,$XR_tag2,$XG_tag2)),"\n";
+            
+            }
+        }
+    }
+    else{
+        warn "Core IDs not equal: $core_name1 != $core_name2\n";
+    }
+}
+
+## The read processing subroutine gets the cigar string and the aligned raw read from the bowtie2 single alignment or multiple alignments subroutine
+## and processes the read to match its corresponding reference genome segment.
+sub read_processing2{
+    my ($cigar, $read) = @_;
+    my $processed_read = '';
+    #print test_out "Read in the subroutine\t$read\n";
+    my $c = () = $cigar =~ /\D/g;
+    #print test_out "Cigar number count:\t\t$c\n";
+    #print test_out "Entered READ PROCESSING ROUTINE\n";
+    if ($c > 1){
+        my $cigar_str = &return_cigar_arr($cigar);
+        #print test_out "Returned Cigar string\t\t$cigar_str\n";
+        $processed_read = &include_cigar($cigar_str, $read);
+        #print test_out "Yes, processed\n";
+    }
+    else{
+        $processed_read = $read;
+    }
+    return $processed_read;
+}
+
+
+## The return cigar array subroutine gets the cigar string from the read processing subroutine and breaks the cigar string into an array of number-letter sub-strings. 
+## For example if the cigar string is "28M2I3M4D", it is broken into an array of substrings like 28M, 2I, 3M and 4D.  
+sub return_cigar_arr{
+    my ($cigar) = @_;
+    #print test_out "Entered RETURN CIGAR ARR ROUTINE\n";
+    my @cigar_arr = split('', $cigar);
+    my @cigar_bits;
+    my @cigar_alpha;
+    for my $char (@cigar_arr){
+        if ($char =~ /\d/){
+            push(@cigar_bits, $char);
+        }
+        else{
+            push(@cigar_bits, $char);
+            my $str = join('',@cigar_bits);
+            push(@cigar_alpha, $str);
+            @cigar_bits = ();
+        }
+    }
+    my $cigar_string = join("\t",@cigar_alpha);
+    #print test_out "CIGAR in the subroutine:\t$cigar_string\n";
+    return $cigar_string;
+}
+
+## The include cigar subroutine gets the cigar substrings and the aligned raw read and processes the read according to the cigar string.
+## Processing involves removing insertions and introducing a '-' in place of a deletion. 
+## After processing the read it is ready to be mapped with its corresponding reference genome segment for methylation calling. 
+sub include_cigar{
+    my ($cigar_str, $read) = @_;
+    my @cigar_arr = split("\t",$cigar_str);
+    my $new_read = '';
+    
+    for(my $i=0; $i < scalar @cigar_arr; $i++){
+    
+        my $letter = $cigar_arr[$i];
+        $letter =~ s/^\d*//;
+        
+        my @num = split($letter,$cigar_arr[$i]);
+        my $x = $num[0];
+        if ($letter eq 'M'){
+            $new_read .=  substr $read, 0,$x;
+            $read =~ s/^.{$x}//;
+        }
+        elsif ($letter eq 'I'){
+            $read =~ s/^.{$x}//;
+        }
+        elsif ($letter eq 'D'){
+            my $gap = '-' x $x;
+            $new_read .= $gap;
+        }
+        else{
+            ;
+        }
+    }
+    return $new_read;
+}
+
+
+
+## call methylation pattern, and generate SAM file similar to Bismark output
+sub methylation_call{
+    my ($genomic_sequence,$sequence_actually_observed,$read_conversion) = @_;
+    
+    # C>T converted reads: keep the downstream 2bp to determine CpG, CHG or CHH context
+    # G>A converted reads: keep the upstream 2bp to determine CpG, CHG or CHH context
+    #print LOG "$genomic_sequence\n$sequence_actually_observed\n$read_conversion\n";
+    if($read_conversion eq 'CT'){
+        $genomic_sequence =~ s/^\w\w//;
+    }
+    elsif($read_conversion eq 'GA'){
+        $genomic_sequence =~ s/\w\w$//;
+    }
+    else{
+        warn "Read conversion type should be CT or GA\n";
+    }
+    ### splitting both the actually observed sequence and the genomic sequence up into single bases so we can compare them one by one
+    my @seq     = split(//,$sequence_actually_observed);
+    my @genomic = split(//,$genomic_sequence);
+    #  print join ("\n",$identifier,$sequence_actually_observed,$genomic_sequence,$read_conversion),"\n";
+    ### Creating a match-string with different characters for non-cytosine bases (disregarding mismatches here), methyl-Cs or non-methyl Cs in either
+    ### CpG, CHH or CHG context
+
+    #################################################################
+    ### . for bases not involving cytosines                       ###
+    ### X for methylated C in CHG context (was protected)         ###
+    ### x for not methylated C in CHG context (was converted)     ###
+    ### H for methylated C in CHH context (was protected)         ###
+    ### h for not methylated C in CHH context (was converted)     ###
+    ### Z for methylated C in CpG context (was protected)         ###
+    ### z for not methylated C in CpG context (was converted)     ###
+    #################################################################
+
+    my @match =();
+    unless (scalar @seq eq (scalar@genomic-2)){ ## CHH changed to -2
+        warn "length of \@seq: ", scalar @seq, "\tlength of \@genomic: ", scalar @genomic, "\n";
+    }
+    my $methyl_CHH_count = 0;
+    my $methyl_CHG_count = 0;
+    my $methyl_CpG_count = 0;
+    my $unmethylated_CHH_count = 0;
+    my $unmethylated_CHG_count = 0;
+    my $unmethylated_CpG_count = 0;
+
+    if ($read_conversion eq 'CT'){
+        for my $index (0..$#seq) {
+            if ($seq[$index] eq $genomic[$index]) {
+                ### The residue can only be a C if it was not converted to T, i.e. protected my methylation
+                if ($genomic[$index] eq 'C') {
+                    ### If the residue is a C we want to know if it was in CpG context or in any other context
+                    my $downstream_base = $genomic[$index+1];
+                    
+                    if ($downstream_base eq 'G'){
+                        ++$methyl_CpG_count;
+                        push @match,'Z'; # protected C, methylated, in CpG context
+                    }
+                    else {
+                        ### C in not in CpG-context, determining the second downstream base context
+                        my $second_downstream_base = $genomic[$index+2];
+                    
+                        if ($second_downstream_base eq 'G'){
+                            ++$methyl_CHG_count;
+                            push @match,'X'; # protected C, methylated, in CHG context
+                        }
+                        else{
+                            ++$methyl_CHH_count;
+                            push @match,'H'; # protected C, methylated, in CHH context
+                        }
+                    }
+                }
+                else {
+                    push @match, '.';
+                }
+            }
+            elsif ($seq[$index] ne $genomic[$index]) {
+                ### for the methylation call we are only interested in mismatches involving cytosines (in the genomic sequence) which were converted into Ts
+                ### in the actually observed sequence
+                if ($genomic[$index] eq 'C' and $seq[$index] eq 'T') {
+                    ### If the residue was converted to T we want to know if it was in CpG, CHG or CHH  context
+                    my $downstream_base = $genomic[$index+1];
+                    
+                    if ($downstream_base eq 'G'){
+                        ++$unmethylated_CpG_count;
+                        push @match,'z'; # converted C, not methylated, in CpG context
+                    }
+
+                    else{
+                        ### C in not in CpG-context, determining the second downstream base context
+                        my $second_downstream_base = $genomic[$index+2];
+                    
+                        if ($second_downstream_base eq 'G'){
+                            ++$unmethylated_CHG_count;
+                            push @match,'x'; # converted C, not methylated, in CHG context
+                        }
+                        else{
+                            ++$unmethylated_CHH_count;
+                            push @match,'h'; # converted C, not methylated, in CHH context
+                        }
+                    }
+                }
+                ### all other mismatches are not of interest for a methylation call
+                else {
+                    push @match,'.';
+                }
+            }
+            else{
+                die "There can be only 2 possibilities\n";
+            }
+        }
+    }
+  
+    elsif ($read_conversion eq 'GA'){
+        
+        for my $index (0..$#seq) {
+            if ($seq[$index] eq $genomic[$index+2]) {
+                ### The residue can only be a G if the C on the other strand was not converted to T, i.e. protected my methylation
+                if ($genomic[$index+2] eq 'G') {
+                    ### If the residue is a G we want to know if the C on the other strand was in CpG, CHG or CHH context, therefore we need
+                    ### to look if the base upstream is a C
+
+                    my $upstream_base = $genomic[$index+1];
+                
+                    if ($upstream_base eq 'C'){
+                        ++$methyl_CpG_count;
+                        push @match,'Z'; # protected C on opposing strand, methylated, in CpG context
+                    }
+                    else{
+                        ### C in not in CpG-context, determining the second upstream base context
+                        my $second_upstream_base = $genomic[$index];
+                
+                        if ($second_upstream_base eq 'C'){
+                            ++$methyl_CHG_count;
+                            push @match,'X'; # protected C on opposing strand, methylated, in CHG context
+                        }
+                        else{
+                            ++$methyl_CHH_count;
+                            push @match,'H'; # protected C on opposing strand, methylated, in CHH context
+                        }
+                    }
+                }
+                else{
+                    push @match, '.';
+                }
+            }
+            elsif ($seq[$index] ne $genomic[$index+2]) {
+                ### for the methylation call we are only interested in mismatches involving cytosines (in the genomic sequence) which were converted to Ts
+                ### on the opposing strand, so G to A conversions in the actually observed sequence
+                if ($genomic[$index+2] eq 'G' and $seq[$index] eq 'A') {
+                    ### If the C residue on the opposing strand was converted to T then we will see an A in the currently observed sequence. We want to know if
+                    ### the C on the opposing strand was it was in CpG, CHG or CHH context, therefore we need to look one (or two) bases upstream!
+
+                    my $upstream_base = $genomic[$index+1];
+
+                    if ($upstream_base eq 'C'){
+                        ++$unmethylated_CpG_count;
+                        push @match,'z'; # converted C on opposing strand, not methylated, in CpG context
+                    }
+
+                    else{
+                        ### C in not in CpG-context, determining the second upstream base context
+                        my $second_upstream_base = $genomic[$index];
+                    
+                        if ($second_upstream_base eq 'C'){
+                            ++$unmethylated_CHG_count;
+                            push @match,'x'; # converted C on opposing strand, not methylated, in CHG context
+                        }
+                        else{
+                            ++$unmethylated_CHH_count;
+                            push @match,'h'; # converted C on opposing strand, not methylated, in CHH context
+                        }
+                    }
+                }
+                ### all other mismatches are not of interest for a methylation call
+                else {
+                    push @match,'.';
+                }
+            }
+            else{
+                die "There can be only 2 possibilities\n";
+            }
+        }
+    }
+  
+    else{
+        die "Strand conversion info is required to perform a methylation call\n";
+    }
+
+    my $methylation_call = join ("",@match);
+
+    $counting{total_meCHH_count} += $methyl_CHH_count;
+    $counting{total_meCHG_count} += $methyl_CHG_count;
+    $counting{total_meCpG_count} += $methyl_CpG_count;
+    $counting{total_unmethylated_CHH_count} += $unmethylated_CHH_count;
+    $counting{total_unmethylated_CHG_count} += $unmethylated_CHG_count;
+    $counting{total_unmethylated_CpG_count} += $unmethylated_CpG_count;
+    
+    return $methylation_call;
+}
+
+
+## make report file with statistics for mapping and methylation calling
+sub make_report{
+    my $report_file_name = shift;
+
+    my $CpG_methylation_level = $counting{total_meCpG_count} + $counting{total_unmethylated_CpG_count} > 0 ? sprintf("%.1f", $counting{total_meCpG_count}/($counting{total_meCpG_count} + $counting{total_unmethylated_CpG_count})*100) . "%" : 'NA';
+    my $CHG_methylation_level = $counting{total_meCHG_count} + $counting{total_unmethylated_CHG_count} > 0 ? sprintf("%.1f", $counting{total_meCHG_count}/($counting{total_meCHG_count} + $counting{total_unmethylated_CHG_count})*100) . "%" : 'NA';
+    my $CHH_methylation_level = $counting{total_meCHH_count} + $counting{total_unmethylated_CHH_count} > 0 ? sprintf("%.1f", $counting{total_meCHH_count}/($counting{total_meCHH_count} + $counting{total_unmethylated_CHH_count})*100) . "%" : 'NA';
+    my $percent_recovered_seq = $counting{total_read_pair}>0 ? sprintf("%.1f", $counting{total_recovered_sequence}/$counting{total_read_pair}*100) . "%" : 'NA';
+    
+    my $percent_unique_mappable = $counting{total_recovered_sequence} > 0 ? sprintf("%.1f", $counting{unique_mappable_read}/$counting{total_recovered_sequence}*100) . "%" : 'NA';
+
+    
+    
+    open(REPORT, ">$report_file_name")||die"Cannot open $report_file_name\n";
+    
+    print REPORT "#"x60 . "\n";
+    print REPORT "HBS_mapper (version: $version) report\n";
+    print REPORT "#"x60 . "\n";
+    print REPORT "### Statistics about original sequence recovery\n\n";
+    warn "### Statistics about original sequence recovery\n\n";
+    print REPORT "Total number of read pairs: " . $counting{total_read_pair} . "\n\n";
+    warn "Total number of read pairs: " . $counting{total_read_pair} . "\n\n";
+    print REPORT "Total number of recovered original sequences: " . $counting{total_recovered_sequence} . "\n";
+    warn "Total number of recovered original sequences: " . $counting{total_recovered_sequence} . "\n";
+    print REPORT "Fraction of recovered original sequence: " . $percent_recovered_seq . "\n\n";
+    warn "Fraction of recovered original sequence: " . $percent_recovered_seq . "\n\n";
+    
+    print REPORT "### Statistics about mapping\n\n";
+    warn "### Statistics about mapping\n\n";
+    print REPORT "Number of alignments with a unique best hit from the different alignments:\t" . $counting{unique_mappable_read} . "\n";
+    warn "Number of alignments with a unique best hit from the different alignments:\t" . $counting{unique_mappable_read} . "\n";
+    print REPORT "Mapping efficiency:\t" . $percent_unique_mappable . "\n";
+    warn "Mapping efficiency:\t" . $percent_unique_mappable . "\n";
+    #print REPORT "Total number of mappable reads: $counting{total_mappable_read}\n";
+    print REPORT "Sequences with no alignments under any condition:\t " . ($counting{total_recovered_sequence}-$counting{total_mappable_read}) . "\n";
+    warn "Sequences with no alignments under any condition:\t " . ($counting{total_recovered_sequence}-$counting{total_mappable_read}) . "\n";
+    print REPORT "Sequences did not map uniquely:\t" . ($counting{total_mappable_read}-$counting{unique_mappable_read}) . "\n\n";
+    warn "Sequences did not map uniquely:\t" . ($counting{total_mappable_read}-$counting{unique_mappable_read}) . "\n\n";
+
+    print REPORT "#"x60 . "\n";
+    print REPORT "### Statistics about methylation calling\n\n";
+    warn "### Statistics about methylation calling\n\n";
+    print REPORT "Total number of methylated CpG:  $counting{total_meCpG_count}\n";
+    warn "Total number of methylated CpG:  $counting{total_meCpG_count}\n";
+    print REPORT "Total number of methylated CHG:  $counting{total_meCHG_count}\n";
+    warn "Total number of methylated CHG:  $counting{total_meCHG_count}\n";
+    print REPORT "Total number of methylated CHH:  $counting{total_meCHH_count}\n\n";
+    warn "Total number of methylated CHH:  $counting{total_meCHH_count}\n\n";
+    
+    print REPORT "Total number of unmethylated CpG:  $counting{total_unmethylated_CpG_count}\n";
+    warn "Total number of unmethylated CpG:  $counting{total_unmethylated_CpG_count}\n";
+    print REPORT "Total number of unmethylated CHG:  $counting{total_unmethylated_CHG_count}\n";
+    warn "Total number of unmethylated CHG:  $counting{total_unmethylated_CHG_count}\n";
+    print REPORT "Total number of unmethylated CHH:  $counting{total_unmethylated_CHH_count}\n\n";
+    warn "Total number of unmethylated CHH:  $counting{total_unmethylated_CHH_count}\n\n";
+
+    print REPORT "Methylation level for CpG: $CpG_methylation_level\n";
+    warn "Methylation level for CpG: $CpG_methylation_level\n";
+    print REPORT "Methylation level for CHG: $CHG_methylation_level\n";
+    warn "Methylation level for CHG: $CHG_methylation_level\n";
+    print REPORT "Methylation level for CHH: $CHH_methylation_level\n\n\n";
+    warn "Methylation level for CHH: $CHH_methylation_level\n\n\n";
+    
+    close REPORT;
+    
+    
+}
+
+
+## print help information
+sub print_help{
+  print << 'HOW_TO';
+
+=================================================================================
+    HBS_mapper (Version 1.1)
+=================================================================================
+
+DESCRIPTION
+
+HB_mapper is used to mapping hairpin bisulfite sequencing data. It first recovers
+original sequences based on the alignment of read1 and read, and then map the 
+recovered sequence to reference genome using Bowtie1/Bowtie2. The SAM file with 
+methylation pattern for cytosines is generated.
+
+
+USAGE: hbs_mapper [options] <bowtie index> <read1 file> <read2 file> 
+
+ARGUMENTS:
+
+    <bowtie index>  Prefix for index generated by bowtie-build or bowtie2-build
+
+    <read1 file>                Read file1, can be fasta or fastq format
+    
+    <read2 file>                Read file2, can be fasta or fastq format.
+                                Read1 and read2 files should be of the same format,
+                                and reads are of identical order.
+                                
+
+OPTIONS:
+
+    -f/--fasta                  Input files are of fastA format
+    
+    -q/--fastq                  Input files are of fastQ format
+
+    -i/--identity               Minimum identity required between read pairs (between 0 to 1, default: 0.9)
+
+    -s/--skip <int>             Skip the first <int> reads/pairs from the input (default: no skip)
+
+    -u/--upto <int>             Only aligns the first <int> reads/pairs from the input (default: no limit)
+
+    --phred33-quals             FASTQ qualities are ASCII chars equal to the Phred quality plus 33. (default: on)
+
+    --phred64-quals             FASTQ qualities are ASCII chars equal to the Phred quality plus 64. (default: off)
+
+    --path_to_bowtie            The full path to the Bowtie (1 or 2). If not specified it is assumed that 
+                                Bowtie (1 or 2) is in the PATH.
+
+    --keep-temp                 Keep the temporary files generated during the running of hbs_mapper. 1 for keep and
+                                0 for delete. (default: 0)
+
+
+Bowtie1 OPTIONS:
+
+    -l/--seedlen <int>          Seed length; i.e., the number of bases of the high quality end of the read to
+                                which the -n ceiling applies. (default: 28)
+
+    -n/--seedmms <int>          Maximum number of mismatches permitted in the "seed", i.e. the first L base pairs
+                                of the read (where L is set with -l/--seedlen). (0|1|2|3, default: 2)
+                                
+    -e/--maqerr  <int>          Maximum permitted total of quality values at all mismatched read positions throughout
+                                the entire alignment, not just in the "seed". (default: 70)
+                                
+    -m <int>                    Suppress all alignments if > <int> exist (default: 1)
+    
+    --best                      Hits guaranteed best stratum; ties broken by quality
+
+    --no_best                   Disables the --best option which is on by default 
+
+    --chunkmbs <int>            Megabytes of memory a given thread is given to store path descriptors (default 512)
+
+
+Bowtie 2 OPTIONS
+
+    --bowtie2                   Use bowtie2 instead of bowtie1
+
+    -N <int>                    Mismatches allowed (0|1, default: 0)
+
+    -L <int>                    Seed length to align during multiseed alignment(default: 22)
+
+    --ignore-quals              When calculating a mismatch penalty, always consider the quality value at the mismatched
+                                position to be the highest possible, regardless of the actual value. 
+    
+    -D <int>                    Up to <int> consecutive seed extension attempts can "fail" before Bowtie 2 moves on, using
+                                the alignments found so far (default: 15)
+
+    -R <int>                    The maximum number of times Bowtie 2 will "re-seed" reads with repetitive seeds (default: 2)
+                                
+    --score_min <func>          Sets a function governing the minimum alignment score needed for an alignment to be considered
+                                "valid" (default: L,0,-0.2)
+
+Output options:
+
+    -o/--output_dir <dir>       Write all output files into this directory (default: ./)
+    
+    --sam-no-hd                 Suppress SAM header lines (starting with @) (default: output SAM header lines)
+
+ 
+Other options:
+
+    -h/--help                   Display help information
+    
+    -v/--version                Display version information
+    
+
+This script was last modified on Nov 22, 2015
+
+HOW_TO
+}
+
+## parse arguments obtained from command line
+sub parse_arguments{
+    my $work_dir;
+    my @bowtie_options;
+    my $help;
+    my $path_to_bowtie;
+    my $fastq;
+    my $fasta;
+    my $skip;
+    my $qupto;
+    my $phred64;
+    my $phred33;
+    my $solexa;
+    my $identity_thres;
+	my $keep_temp;
+  
+    my $mismatches;
+    my $seed_length;
+    my $best;
+    my $no_best;
+    my $sequence_format;
+    my $ver;
+    my $quiet;
+    my $chunk;
+    my $ceiling;
+    my $output_dir;
+    my $bowtie2;
+    my $ignore_quals;
+    my $sam_no_hd;
+    my $seed_extension_fails;
+    my $reseed_repetitive_seeds;
+    my $score_min;
+    my $parallel;
+    
+    my $command_line = GetOptions ('help|man' => \$help,
+                 'path_to_bowtie=s' => \$path_to_bowtie,
+                 'f|fasta' => \$fasta,
+                 'q|fastq' => \$fastq,
+                 'i|identity=f'=>\$identity_thres,
+                 's|skip=i' => \$skip,
+                 'u|upto=i' => \$qupto,
+                 'phred33-quals' => \$phred33,
+                 'phred64-quals|solexa1' => \$phred64,
+                 'solexa-quals' => \$solexa,
+				 'keep-temp=i' => \$keep_temp,
+                 'n|seedmms=i' => \$mismatches,
+                 'l|seedlen=i' => \$seed_length,
+                 'best'    => \$best,
+                 'no-best' => \$no_best,
+                 'version' => \$ver,
+                 'quiet' => \$quiet,
+                 'chunkmbs=i' => \$chunk,
+                 'e|maqerr=i' => \$ceiling,
+                 'o|output_dir=s' => \$output_dir,
+                 'bowtie2' => \$bowtie2,
+                 'ignore-quals' => \$ignore_quals,
+                 'sam-no-hd' => \$sam_no_hd,
+                 'D=i' => \$seed_extension_fails,
+                 'R=i' => \$reseed_repetitive_seeds,
+                 'score_min=s' => \$score_min,
+                 'p=i' => \$parallel,
+                );
+
+    ### EXIT ON ERROR if there were errors with any of the supplied options
+    unless ($command_line){
+        die "Please respecify command line options.\n";
+    }
+    ### HELPFILE
+    if (@ARGV!=3 || $help){
+        print_help();
+        exit;
+    }
+    if ($ver){
+        print "HBS_mapper, version $version\n";
+        exit;
+    }
+    
+    ##########################
+    ### PROCESSING OPTIONS ###
+    ##########################
+    
+    ## working directory
+    $work_dir = getcwd;
+    $work_dir =~ s/$/\// unless $work_dir =~ /\/$/;
+    warn "\nWorking directory is: $work_dir\n";
+    
+    ## mandatory options
+    
+    # bowtie index, and read1 and read2 files are mandatory
+    ($bowtie_index, $read_file1, $read_file2) = @ARGV;
+
+    ### checking BOWTIE INDEX
+    warn "Bowtie index was specified as: $bowtie_index\n";
+
+    if ($bowtie2){ ### Bowtie 2
+        my @bowtie_index = ('1.bt2','2.bt2','3.bt2','4.bt2','rev.1.bt2','rev.2.bt2');
+        foreach my $x (@bowtie_index){
+            my $file = $bowtie_index . ".$x";
+            unless (-f $file){
+                die "The Bowtie 2 index seems to be faulty ($file). Please check it.\n";
+            }
+        }
+    }else{ ### Bowtie 1 (default)
+        my @bowtie_index = ('1.ebwt','2.ebwt','3.ebwt','4.ebwt','rev.1.ebwt','rev.2.ebwt');
+        foreach my $x (@bowtie_index){
+            my $file = $bowtie_index . ".$x";
+            unless (-f $file){
+                die "The Bowtie index seems to be faulty ($file). Please check it.\n";
+            }
+        }
+    }
+    
+    ## checking input files for read1 and read2
+    die "$read_file1 doesn't exist\n" unless -f $read_file1;
+    die "$read_file2 doesn't exist\n" unless -f $read_file2;
+    
+    ## check nw_align, which is used for the alignment of read1 and read2
+    die "nw_align cannot be found in $Bin/\nYou should compile $Bin/nw_align.c to generate it!\n" unless -f "$Bin/nw_align";
+    
+	## keep temp files or not
+	$keep_temp ||= 0;
+	unless($keep_temp == 0 || $keep_temp == 1){
+		die "The parameter keep-temp should be specified as 0 or 1\n";
+	}
+    ## identity threshold
+    unless($identity_thres){
+        $identity_thres = 0.9;
+    }
+    unless($identity_thres>0 && $identity_thres<=1){
+        die "The identity threshold should be between 0 and 1\n";
+    }
+        
+    # bowtie2
+    unless ($bowtie2){
+        $bowtie2 = 0;
+    }
+    if($sam_no_hd){
+        $sam_no_hd = 1;
+    }else{
+        $sam_no_hd = 0;
+    }
+
+    ### PATH TO BOWTIE
+    ### if a special path to Bowtie 1/2 was specified we will use that one, otherwise it is assumed that Bowtie 1/2 is in the PATH
+    if ($path_to_bowtie){
+        $path_to_bowtie =~ s/\/$//;
+        if (-d $path_to_bowtie){
+            if ($bowtie2){
+                $path_to_bowtie = "${path_to_bowtie}/bowtie2";
+                warn "Path to Bowtie 2 specified as: $path_to_bowtie\n";
+            }else{
+                $path_to_bowtie = "${path_to_bowtie}/bowtie";
+                warn "Path to Bowtie specified as: $path_to_bowtie\n";
+            }
+            unless(-e $path_to_bowtie){
+                die "$path_to_bowtie unexist!\n";
+            }
+            # unless($path_to_bowtie =~ /^\//){
+                # $path_to_bowtie = "$work_dir/$path_to_bowtie" if defined $output_dir;
+            # }
+        }else{
+            die "The path to bowtie provided ($path_to_bowtie) is invalid (not a directory)!\n";
+        }
+        
+    }else{
+        if ($bowtie2){
+            $path_to_bowtie = 'bowtie2';
+            warn "Path to Bowtie 2 specified as: $path_to_bowtie\n";
+        }else{
+            $path_to_bowtie = 'bowtie';
+            warn "Path to Bowtie specified as: $path_to_bowtie\n";
+        }
+    }
+
+    ####################################
+    ### PROCESSING ARGUMENTS
+    
+    ### INPUT OPTIONS
+
+    ### SEQUENCE FILE FORMAT
+    ### exits if both fastA and FastQ were specified
+    if ($fasta and $fastq){
+        die "Only one sequence file format can be specified (fastA or fastQ)\n";
+    }
+
+    ### unless fastA is specified explicitely, fastQ sequence format is expected by default
+    if ($fasta){
+        warn "File format specified as: FastA\n";
+        $sequence_format = 'FASTA';
+        push @bowtie_options, '-f';
+    }
+    elsif ($fastq){
+        warn "File format specified as: FastQ\n";
+        $sequence_format = 'FASTQ';
+        push @bowtie_options, '-q';
+    }
+    else{
+        $fastq = 1;
+        warn "File format specified as: FastQ (by default)\n";
+        $sequence_format = 'FASTQ';
+        push @bowtie_options, '-q';
+    }
+
+    ### SKIP
+    if ($skip){
+        warn "Skipping the first $skip reads from the input file\n";
+        push @bowtie_options,"-s $skip";
+    }
+
+    ### UPTO
+    if ($qupto){
+        warn "Processing sequences up to read no. $qupto from the input file\n";
+        push @bowtie_options,"-u $qupto"; ## slightly changed for Bowtie 2
+    }
+
+    ### QUALITY VALUES
+    if (($phred33 and $phred64) or ($phred33 and $solexa) or ($phred64 and $solexa)){
+        die "You can only specify one type of quality value at a time! (--phred33-quals or --phred64-quals or --solexa-quals)";
+    }
+    if ($phred33){ ## if nothing else is specified $phred33 will be used as default by both Bowtie 1 and 2.
+    # Phred quality values work only when -q is specified
+        unless ($fastq){
+            die "Phred quality values works only when -q (FASTQ) is specified\n";
+        }
+        if ($bowtie2){
+            push @bowtie_options,"--phred33";
+        }
+        else{
+            push @bowtie_options,"--phred33-quals";
+        }
+    }
+    if ($phred64){
+        # Phred quality values work only when -q is specified
+        unless ($fastq){
+        die "Phred quality values work only when -q (FASTQ) is specified\n";
+        }
+        if ($bowtie2){
+            push @bowtie_options,"--phred64";
+        }
+        else{
+            push @bowtie_options,"--phred64-quals";
+        }
+    }
+    else{
+        $phred64 = 0;
+    }
+
+    if ($solexa){
+        if ($bowtie2){
+            die "The option '--solexa-quals' is not compatible with Bowtie 2. Please respecify!\n";
+        }
+        # Solexa to Phred value conversion works only when -q is specified
+        unless ($fastq){
+            die "Conversion from Solexa to Phred quality values works only when -q (FASTQ) is specified\n";
+        }
+        push @bowtie_options,"--solexa-quals";
+    }
+    else{
+        $solexa = 0;
+    }
+
+    ### ALIGNMENT OPTIONS
+
+    ### MISMATCHES
+    if (defined $mismatches){
+        if ($bowtie2){
+            if ($mismatches == 0 or $mismatches == 1){
+                push @bowtie_options,"-N $mismatches";
+            }
+            else{
+                die "Please set the number of multiseed mismatches for Bowtie 2 with '-N <int>' (where <int> can be 0 or 1)\n";
+            }
+        }
+        else{
+            if ($mismatches >= 0 and $mismatches <= 3){
+                push @bowtie_options,"-n $mismatches";
+            }
+            else{
+                die "Please set the number of seed mismatches for Bowtie 1 with '-n <int>' (where <int> can be 0,1,2 or 3)\n";
+            }
+        }
+    }
+    else{ # defaults for bowtie1 (2) and bowtie2 (0)
+        if($bowtie2){
+            push @bowtie_options,"-N 0";
+        }
+        else{
+            push @bowtie_options,"-n 2";
+        }
+    }
+
+    ### SEED LENGTH
+    if (defined $seed_length){
+        if ($bowtie2){
+            push @bowtie_options,"-L $seed_length";
+        }
+        else{
+            push @bowtie_options,"-l $seed_length";
+        }
+    }
+    else{ # defaults for bowtie1 (28) and bowtie2 (22)
+        if($bowtie2){
+            push @bowtie_options,"-L 22";
+        }
+        else{
+            push @bowtie_options,"-l 28";
+        }
+    }
+
+    ### MISMATCH CEILING
+    if (defined $ceiling){
+        die "The option '-e' is not compatible with Bowtie 2. Please respecify options\n" if ($bowtie2);
+        push @bowtie_options,"-e $ceiling";
+    }
+
+    ### BOWTIE 2 EFFORT OPTIONS
+
+    ### CONSECUTIVE SEED EXTENSION FAILS
+    if (defined $seed_extension_fails){
+        die "The option '-D <int>' is only available when using Bowtie 2\n\n" unless ($bowtie2);
+        push @bowtie_options,"-D $seed_extension_fails";
+    }
+
+    ### RE-SEEDING REPETITIVE SEEDS
+    if (defined $reseed_repetitive_seeds){
+        die "The option '-R <int>' is only available when using Bowtie 2\n\n" unless ($bowtie2);
+        push @bowtie_options,"-R $reseed_repetitive_seeds";
+    }
+
+
+    ### BOWTIE 2 SCORING OPTIONS
+    if ($score_min){
+        die "The option '--score_min <func>' is only available when using Bowtie 2\n\n" unless ($bowtie2);
+        unless ($score_min =~ /^L,.+,.+$/){
+            die "The option '--score_min <func>' needs to be in the format <L,value,value> . Please consult \"setting up functions\" in the Bowtie 2 manual for further information\n\n";
+        }
+        push @bowtie_options,"--score-min $score_min";
+    }
+    else{
+        if ($bowtie2){
+            push @bowtie_options,"--score-min L,0,-0.2"; # default setting, more stringent than normal Bowtie2
+        }
+    }
+
+    ### BOWTIE 2 PARALLELIZATION OPTIONS
+    if (defined $parallel){
+        #die "The parallelization switch '-p' only works for Bowtie 2. Please respecify!" unless ($bowtie2);
+        push @bowtie_options,"-p $parallel";
+    }
+    if ($bowtie2){
+        if ($parallel){
+            die "Please select a value for -p of 2 or more!\n" unless ($parallel > 1);
+            push @bowtie_options,"-p $parallel";
+            push @bowtie_options,'--reorder'; ## re-orders the bowtie 2 output so that it does match the input files. This is abolutely required for parallelization to work.
+            warn "Each Bowtie 2 instance is going to be run with $parallel threads. Please monitor performance closely and tune down if needed!\n";
+            sleep (2);
+        }
+    }
+
+    ### REPORTING OPTIONS
+    ## HBS_mapper always output one output for each read
+    push @bowtie_options,'-k 2';
+    ## the max number of alignments for each read could be reported
+    ## here it is set as 2, and at later steps, further filtering will be performed to get the unique alignments
+    # if($bowtie2){
+        # push @bowtie_options, "-k 2";
+    # }else{
+        # push @bowtie_options, "-m 2";
+    # }
+    
+    ### ignore quals
+    if(defined $ignore_quals){
+        push @bowtie_options,'--ignore-quals' ; ## All mismatches will receive penalty for mismatches as if they were of high quality, which is 6 by default
+    }
+
+    ### --BEST
+    if($best && $no_best){
+        die "The options --best and --no-best cannot be specified at the same time\n";
+    }
+    if ($bowtie2){
+        if ($no_best){    # Bowtie 2 does away with the concept of --best, so one can also not select --no-best when Bowtie 2 is to be used
+            die "The option '--no-best' is not compatible with Bowtie 2. Please respecify options\n";
+        }
+    }
+    else{
+        # --best is the default option for Bowtie 1, specifying --no-best can turn it off (e.g. to speed up alignment process)
+        unless ($no_best){
+            push @bowtie_options,'--best';
+        }
+    }
+
+    ### QUIET prints nothing  besides alignments (suppresses warnings)
+    if ($quiet){
+        push @bowtie_options,'--quiet';
+    }
+
+    ### CHUNKMBS needed to be increased to avoid memory exhaustion warnings for Bowtie 1, particularly for --best (and paired-end) alignments
+    unless ($bowtie2){ # Bowtie 2 does not have a chunkmbs option
+        if (defined $chunk){
+            push @bowtie_options,"--chunkmbs $chunk";
+        }
+        else{
+            push @bowtie_options,'--chunkmbs 512'; ## setting the default to 512MB (up from 64 default)
+        }
+    }
+
+    ### SUMMARY OF ALL BOWTIE OPTIONS
+    my $bowtie_options = join (' ',@bowtie_options);
+
+    ### OUTPUT DIRECTORY
+    chdir $work_dir or die "Failed to move back to current working directory\n";
+    if ($output_dir){
+        unless ($output_dir =~ /\/$/){
+            $output_dir =~ s/$/\//;
+        }
+
+        if (chdir $output_dir){
+            $output_dir = getcwd; #  making the path absolute
+            unless ($output_dir =~ /\/$/){
+                $output_dir =~ s/$/\//;
+            }
+        }
+        else{
+            mkdir $output_dir or die "Unable to create directory $output_dir $!\n";
+            warn "Created output directory $output_dir\n\n";
+            chdir $output_dir or die "Failed to move to $output_dir\n";
+            $output_dir = getcwd; #  making the path absolute
+            unless ($output_dir =~ /\/$/){
+                $output_dir =~ s/$/\//;
+            }
+        }
+        chdir $work_dir;
+    }
+    else{
+        $output_dir = './';
+    }
+    warn "Output directory specified as: $output_dir\n";
+
+    return ($read_file1,$read_file2,$bowtie_index,$path_to_bowtie,$bowtie2,$keep_temp, $identity_thres,$sequence_format,$bowtie_options,
+            $phred64,$solexa,$work_dir,$output_dir, $sam_no_hd);
+}
+
+__END__

@@ -1,0 +1,126 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+
+## This program is Copyright (C) 2015-16, Ming-an Sun (mingansun@gmail.com)
+
+## This program is free software: you can redistribute it and/or modify
+## it under the terms of the GNU General Public License as published by
+## the Free Software Foundation, either version 3 of the License, or
+## (at your option) any later version.
+
+## This program is distributed in the hope that it will be useful,
+## but WITHOUT ANY WARRANTY; without even the implied warranty of
+## MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+## GNU General Public License for more details.
+
+## You should have received a copy of the GNU General Public License
+## along with this program. If not, see <http://www.gnu.org/licenses/>.
+
+
+unless(@ARGV>=1){
+    print << 'USAGE';
+    
+    This script is used to summarize methylation level and methylation fidelity for
+    CpG dyads from the output of HB_methylation_extractor.
+    Since the methylation callings are outputed without sorting by genomic coordinates, this
+    script needs to read into all methylation calling into memory, thus may need huge memory.
+    To reduce memory usage, it is suggested to cut data to each chromosome, and then calculate separately.
+    
+    Usage: hbs_cg_mlmf <hbs_methylation_extractor results for CpG context>
+    
+    The output is a tab-delimited file, with each column described as below:
+    1. chromosome name
+    2. CpG position
+    3. methylation level
+    4. methylation fidelity (NA for cannot be calculated)
+    5. count of mC/mC
+    6. count of mC/C
+    7. count of C/mC
+    8. count of C/C
+    9. count of mC/? (? for missed methylation pattern)
+    10. count of C/?
+    11. count of ?/mC
+    12. count of ?/C
+    
+    Note: ? for missed methylation pattern. Due to reasons such as sequencing errors, for certain CpGs, 
+    occasionally only one read from a read pair could report a methylation calling.
+    
+    This script was last modified on Nov 22, 2015.
+    
+USAGE
+
+exit(-1);
+}
+
+my @infiles = @ARGV;
+
+my %stat;
+
+
+foreach my $infile (@infiles){
+    warn "\nReading info from $infile ...\n";
+    #1:1101:2996:2153/2	chr19	+	25044541	Z
+    open(IN, $infile)||die"Cannot open $infile\n";
+    while(my $ln = <IN>){
+        next if $ln =~ /^HBS\s+methylation\s+extractor/;
+        my ($readID, $chr, $strand, $position, $pattern) = split(/\s+/, $ln);
+        if($readID =~ /^(\S+)\/([12])$/){
+            my ($read_core, $read_tag) = ($1, $2);
+            $position-- if $strand eq "-";
+            $stat{$chr}->{$position}->{$read_core}->{$read_tag} = $pattern;
+        }else{
+            print STDERR "Cannot find read tag (1 or 2) in $ln";
+        }
+    }
+    close IN;
+}
+
+warn "\nOutput ML and MF for each CpG dyads ...\n";
+
+print "#chrom\tposition\tmethyl_level\tmethyl_fidelity\t";
+print "count_mC_mC\tcount_mC_C\tcount_C_mC\tcount_C_C\t";
+print "count_mC_?\tcount_C_?\tcount_?_mC\tcount_?_C\n";
+foreach my $chr (sort keys %stat){
+    foreach my $position (sort {$a <=> $b} keys %{$stat{$chr}}){
+        my %count;
+        foreach my $id (keys %{$stat{$chr}->{$position}}){
+            my $a = defined $stat{$chr}->{$position}->{$id}->{1} ? $stat{$chr}->{$position}->{$id}->{1} : 'N';
+            my $b = defined $stat{$chr}->{$position}->{$id}->{2} ? $stat{$chr}->{$position}->{$id}->{2} : 'N';
+            if($a =~ /[ZzN]/ && $b =~ /[ZzN]/){
+                $count{"$a$b"}++;
+            }else{
+                print STDERR "Pattern unrecognized: $a\t$b\n";
+            }
+        }
+        my $ZZ = defined $count{'ZZ'} ? $count{'ZZ'} : 0;
+        my $Zz = defined $count{'Zz'} ? $count{'Zz'} : 0;
+        my $zZ = defined $count{'zZ'} ? $count{'zZ'} : 0;
+        my $zz = defined $count{'zz'} ? $count{'zz'} : 0;
+        my $ZN = defined $count{'ZN'} ? $count{'ZN'} : 0;
+        my $zN = defined $count{'zN'} ? $count{'zN'} : 0;
+        my $NZ = defined $count{'NZ'} ? $count{'NZ'} : 0;
+        my $Nz = defined $count{'Nz'} ? $count{'Nz'} : 0;
+
+        my $ml = $ZZ+$Zz+$zZ+$zz+$ZN+$zN+$NZ+$Nz>0 ? sprintf("%.5f", ($ZZ*2 + $Zz + $zZ + $ZN + $NZ)/($ZZ*2 + $Zz*2 + $zZ*2 + $zz*2 + $ZN + $zN + $NZ + $Nz)) : 'NA';
+        my $mf = $ZZ+$Zz+$zZ+$zz>0 ? sprintf("%.5f", ($ZZ+$zz)/($ZZ+$Zz+$zZ+$zz)) : 'NA';
+        print "$chr\t$position\t$ml\t$mf\t$ZZ\t$Zz\t$zZ\t$zz\t$ZN\t$zN\t$NZ\t$Nz\n";
+        delete $stat{$chr}->{$position};
+    }
+    delete $stat{$chr};
+}
+
+warn "\nJob finished!\n";
+
+__END__
+1:1101:2996:2153/2	chr19	+	25044541	Z
+1:1101:2996:2153/1	chr19	-	25044542	Z
+1:1101:2996:2153/2	chr19	+	25044583	Z
+1:1101:2996:2153/1	chr19	-	25044584	Z
+1:1101:3526:2186/2	chr19	+	55314799	z
+1:1101:3526:2186/1	chr19	-	55314800	Z
+1:1101:3622:2183/2	chr19	+	56630472	Z
+1:1101:3622:2183/1	chr19	-	56630473	Z
+1:1101:5405:2235/1	chr19	+	4913402	Z
+1:1101:5405:2235/2	chr19	-	4913403	Z
+

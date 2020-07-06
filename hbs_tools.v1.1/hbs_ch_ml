@@ -1,0 +1,103 @@
+#!/usr/bin/perl
+use warnings;
+use strict;
+
+## This program is Copyright (C) 2015-16, Ming-an Sun (mingansun@gmail.com)
+
+## This program is free software: you can redistribute it and/or modify
+## it under the terms of the GNU General Public License as published by
+## the Free Software Foundation, either version 3 of the License, or
+## (at your option) any later version.
+
+## This program is distributed in the hope that it will be useful,
+## but WITHOUT ANY WARRANTY; without even the implied warranty of
+## MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+## GNU General Public License for more details.
+
+## You should have received a copy of the GNU General Public License
+## along with this program. If not, see <http://www.gnu.org/licenses/>.
+
+unless(@ARGV>=1){
+    print << 'USAGE';
+    
+    This script is used to get CH methylation level from HBS_methylation_extractor result.
+
+    Usage: hbs_ch_ml <hbs_methylation_extractor results for Non_CpG context>
+            
+    This script was last modified on Nov 22, 2015
+    
+USAGE
+
+exit(-1);
+}
+
+my %info;
+my @infiles = @ARGV;
+	
+foreach my $infile (@infiles){
+	warn "Reading info from $infile into hash ...\n";
+	open(IN, $infile)||die"Cannot open $infile\n";
+	while(<IN>){
+		next if /^HBS/;
+		chomp;
+		my ($id, $chr, $strand, $pos, $call) = split;
+		$info{$chr}->{$pos}->[0]++;
+		$info{$chr}->{$pos}->[1]++ if $call eq 'X' || $call eq 'H';
+		if($call eq 'X' || $call eq 'x'){
+			if(!defined $info{$chr}->{$pos}->[2]){
+				$info{$chr}->{$pos}->[2] = 'CHG'
+			}
+			else{
+				unless($info{$chr}->{$pos}->[2] eq 'CHG'){
+					warn "$chr\t$pos: CHG or CHH?\n";
+				}
+			}
+		}
+		elsif($call eq 'H' || $call eq 'h'){
+			if(!defined $info{$chr}->{$pos}->[2]){
+				$info{$chr}->{$pos}->[2] = 'CHH'
+			}
+			else{
+				unless($info{$chr}->{$pos}->[2] eq 'CHH'){
+					warn "$chr\t$pos: CHG or CHH?\n";
+				}
+			}
+		}
+		else{
+			warn "Cannot determine context for: $call\n";
+		}
+	}
+	close IN;
+}
+
+warn "Output results ...\n";
+my $all_mc = 0;
+my $all_c = 0;
+foreach my $chr (sort keys %info){
+    foreach my $pos (sort {$info{$chr}->{$a} <=> $info{$chr}->{$b}} keys %{$info{$chr}}){
+        print "$chr\t$pos\t";
+        my $c_count  = defined($info{$chr}->{$pos}->[0]) ? $info{$chr}->{$pos}->[0] : 0;
+        my $mc_count = defined($info{$chr}->{$pos}->[1]) ? $info{$chr}->{$pos}->[1] : 0;
+        my $context = $info{$chr}->{$pos}->[2] ? $info{$chr}->{$pos}->[2] : 'NA';
+        print sprintf("%.4f", $mc_count/$c_count) . "\t";
+        print $c_count . "\t" . $mc_count . "\t$context\n";
+        $all_c += $c_count;
+        $all_mc += $mc_count;
+    }
+}
+
+warn "Result:\t" . sprintf("%.4f", $all_mc/$all_c) . "\t$all_c\t$all_mc\n";
+
+warn "Job finished!\n";
+
+__END__
+M00720:135:000000000-AB7G1:1:1101:15405:1609#/1	chr1	+	162153305	h
+M00720:135:000000000-AB7G1:1:1101:15405:1609#/1	chr1	+	162153306	h
+M00720:135:000000000-AB7G1:1:1101:15405:1609#/1	chr1	+	162153307	h
+M00720:135:000000000-AB7G1:1:1101:15405:1609#/1	chr1	+	162153308	h
+M00720:135:000000000-AB7G1:1:1101:15405:1609#/1	chr1	+	162153312	h
+M00720:135:000000000-AB7G1:1:1101:15405:1609#/1	chr1	+	162153315	h
+M00720:135:000000000-AB7G1:1:1101:15405:1609#/1	chr1	+	162153316	h
+M00720:135:000000000-AB7G1:1:1101:15405:1609#/1	chr1	+	162153318	h
+M00720:135:000000000-AB7G1:1:1101:15405:1609#/1	chr1	+	162153320	x
+M00720:135:000000000-AB7G1:1:1101:15405:1609#/1	chr1	+	162153335	h
