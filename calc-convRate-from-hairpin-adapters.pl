@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# This script is used for Hammer-seq analysis, calculate BS conversion rate from unmethylated hairpin adaptors.
+# This script is used for Hammer-seq analysis, calculate BS conversion rate from unmethylated hairpin adapters.
 # zhangzhuqiang@ibp.ac.cn
 # last update: 2020.07.03;
 use strict;
